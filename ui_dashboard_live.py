@@ -1,0 +1,1083 @@
+#!/usr/bin/env python3
+"""
+RULEV3+ Live Dashboard - REAL POLYMARKET DATA
+==============================================
+Connects to real Polymarket WebSocket for live BTC 15-minute prices.
+"""
+
+import asyncio
+import time
+import os
+from datetime import datetime
+from dataclasses import dataclass, field
+from typing import List, Optional
+from collections import deque
+from pathlib import Path
+
+try:
+    from rich.console import Console
+    from rich.layout import Layout
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.live import Live
+    from rich.text import Text
+    from rich import box
+except ImportError:
+    print("Install rich: pip install rich")
+    exit(1)
+
+try:
+    from dotenv import load_dotenv
+    # Load .env from same directory
+    env_path = Path(__file__).parent / ".env"
+    load_dotenv(env_path)
+except ImportError:
+    pass  # dotenv not required
+
+from polymarket_connector import (
+    SessionManager, SessionState, GammaClient,
+    derive_current_slug, format_elapsed, get_zone,
+    SESSION_DURATION
+)
+
+from trade_executor import TradeExecutor, ExecutorConfig, OrderStatus, OrderResult
+
+
+# ============================================================
+# PAPER TRADE TRACKING
+# ============================================================
+
+@dataclass
+class PaperTrade:
+    """Track paper trades for win/loss settlement."""
+    trade_id: int
+    session_id: str
+    direction: str  # "Up" or "Down"
+    entry_price: float
+    shares: float
+    cost: float
+    potential_win: float
+    potential_loss: float
+    zone: str
+    timestamp: datetime = field(default_factory=datetime.now)
+    settled: bool = False
+    won: bool = False
+    pnl: float = 0.0
+
+
+# ============================================================
+# CREDENTIALS & MODE
+# ============================================================
+
+def load_credentials():
+    """Load credentials from .env file."""
+    return {
+        "private_key": os.getenv("PM_PRIVATE_KEY", ""),
+        "wallet_address": os.getenv("PM_WALLET_ADDRESS", ""),
+        "funder_address": os.getenv("PM_FUNDER_ADDRESS", ""),
+        "signature_type": int(os.getenv("PM_SIGNATURE_TYPE", "0")),
+        "trading_mode": os.getenv("TRADING_MODE", "paper").lower(),
+        "execution_enabled": os.getenv("EXECUTION_ENABLED", "false").lower() == "true",
+        "max_live_trades_per_run": int(os.getenv("MAX_LIVE_TRADES_PER_RUN", "1")),
+        "cash_per_trade": float(os.getenv("PM_CASH_PER_TRADE", "10.00")),
+        "max_position": float(os.getenv("PM_MAX_POSITION", "50.00")),
+    }
+
+CREDENTIALS = load_credentials()
+
+def is_real_mode():
+    """Check if TRADING_MODE=real (but execution may still be disabled)."""
+    return (
+        CREDENTIALS["trading_mode"] == "real" and
+        CREDENTIALS["private_key"] and
+        len(CREDENTIALS["private_key"]) > 10
+    )
+
+def is_execution_enabled():
+    """Check if execution is enabled (requires BOTH real mode AND execution_enabled=true)."""
+    return is_real_mode() and CREDENTIALS["execution_enabled"]
+
+
+def fetch_usdc_balance():
+    """Fetch USDC balance from Polymarket CLOB API."""
+    try:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+        private_key = CREDENTIALS["private_key"]
+        funder = CREDENTIALS["funder_address"]
+        sig_type = CREDENTIALS["signature_type"]
+
+        if private_key:
+            client = ClobClient(
+                "https://clob.polymarket.com",
+                key=private_key,
+                chain_id=137,
+                signature_type=sig_type,
+                funder=funder
+            )
+            creds = client.derive_api_key()
+            client.set_api_creds(creds)
+
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            result = client.get_balance_allowance(params)
+            if "balance" in result:
+                return int(result["balance"]) / 1_000_000
+    except Exception as e:
+        pass
+    return 0.0
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+CONFIG = {
+    "strategy": "RULEV3+",
+    "version": "1.0",
+    "mode": "T3-only",
+    "core_window": "3:00-3:29",
+    "recovery_window": "5:00-5:59",
+    "threshold": float(os.getenv("PM_EDGE_THRESHOLD", "0.64")),
+    "safety_cap": float(os.getenv("PM_SAFETY_CAP", "0.72")),
+    "cash_per_trade": float(os.getenv("PM_CASH_PER_TRADE", "1.00")),
+    "max_position": float(os.getenv("PM_MAX_POSITION", "8.00")),
+}
+
+# ============================================================
+# STATE
+# ============================================================
+
+@dataclass
+class DashboardState:
+    # Live market state
+    session: SessionState = field(default_factory=SessionState)
+
+    # Stats
+    start_time: datetime = field(default_factory=datetime.now)
+    trades_total: int = 0
+    trades_won: int = 0
+    trades_lost: int = 0
+    pnl_total: float = 0.0
+    core_entries: int = 0
+    recovery_entries: int = 0
+    sessions_seen: int = 0
+    sessions_skipped: int = 0
+
+    # Wallet
+    usdc_balance: float = 0.0
+    last_balance_check: Optional[datetime] = None
+
+    # Logs
+    logs: deque = field(default_factory=lambda: deque(maxlen=25))
+    log_file: Optional[str] = None
+
+    # Connection
+    connected: bool = False
+    last_update: Optional[datetime] = None
+
+    # Executor state
+    executor: Optional[TradeExecutor] = None
+    executor_connected: bool = False
+    current_session_id: str = ""
+    pending_order: Optional[OrderResult] = None
+    last_order: Optional[OrderResult] = None
+    kill_switch: bool = False
+
+    # Safety limiters
+    live_trades_this_run: int = 0  # Counter for MAX_LIVE_TRADES_PER_RUN
+    max_live_trades_per_run: int = 1  # From .env
+
+    # Paper trade tracking for win/loss settlement
+    pending_paper_trades: List[PaperTrade] = field(default_factory=list)
+    settled_paper_trades: List[PaperTrade] = field(default_factory=list)
+
+    # Periodic logging tracker
+    _last_stats_log: int = 0
+
+    def log(self, msg):
+        t = datetime.now().strftime("%H:%M:%S")
+        # Color code based on message content
+        if "error" in msg.lower() or "fail" in msg.lower():
+            colored_msg = f"[red]{t} ✗ {msg}[/]"
+        elif "connect" in msg.lower() or "subscrib" in msg.lower():
+            colored_msg = f"[green]{t} ✓ {msg}[/]"
+        elif "roll" in msg.lower() or "loaded" in msg.lower():
+            colored_msg = f"[cyan]{t} → {msg}[/]"
+        elif "CORE" in msg or "signal" in msg.lower() or "buy" in msg.lower():
+            colored_msg = f"[bold green]{t} ★ {msg}[/]"
+        elif "RECOVERY" in msg:
+            colored_msg = f"[yellow]{t} ★ {msg}[/]"
+        elif "DEAD" in msg or "skip" in msg.lower():
+            colored_msg = f"[red]{t} ○ {msg}[/]"
+        elif "token" in msg.lower():
+            colored_msg = f"[dim]{t}   {msg}[/]"
+        else:
+            colored_msg = f"[white]{t}   {msg}[/]"
+        self.logs.append(colored_msg)
+
+        # Write to file (with explicit flush)
+        if self.log_file:
+            try:
+                with open(self.log_file, "a", encoding="utf-8") as f:
+                    f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+                    f.flush()
+            except:
+                pass
+
+
+state = DashboardState()
+
+
+def settle_paper_trades(old_session_id: str, final_up_price: float, final_down_price: float):
+    """Settle paper trades when session ends. Determine win/loss based on final prices."""
+    if not state.pending_paper_trades:
+        return
+
+    # Get trades for this session
+    session_trades = [t for t in state.pending_paper_trades if t.session_id == old_session_id and not t.settled]
+
+    if not session_trades:
+        return
+
+    # Determine winner: the side closer to 1.0 wins
+    # At settlement: winner ~= 1.0, loser ~= 0.0
+    # Mid-session we use the current price direction as proxy
+    up_won = final_up_price > final_down_price
+
+    state.log("")
+    state.log(f"{'='*50}")
+    state.log(f"SESSION SETTLEMENT: {old_session_id}")
+    state.log(f"{'='*50}")
+    state.log(f"FINAL UP:   ${final_up_price:.4f}")
+    state.log(f"FINAL DOWN: ${final_down_price:.4f}")
+    state.log(f"WINNER:     {'UP' if up_won else 'DOWN'}")
+    state.log("")
+
+    for trade in session_trades:
+        trade.settled = True
+
+        # Check if trade direction matches winner
+        if (trade.direction == "Up" and up_won) or (trade.direction == "Down" and not up_won):
+            # WIN: we get $1 per share, minus cost
+            trade.won = True
+            trade.pnl = trade.shares - trade.cost  # $1 * shares - cost
+            state.trades_won += 1
+        else:
+            # LOSE: we get $0, lose entire cost
+            trade.won = False
+            trade.pnl = -trade.cost
+            state.trades_lost += 1
+
+        state.pnl_total += trade.pnl
+        state.settled_paper_trades.append(trade)
+
+        result_emoji = "WIN" if trade.won else "LOSS"
+        pnl_str = f"+${trade.pnl:.2f}" if trade.pnl >= 0 else f"-${abs(trade.pnl):.2f}"
+
+        state.log(f"TRADE #{trade.trade_id}: {trade.direction} @ ${trade.entry_price:.2f}")
+        state.log(f"  RESULT: {result_emoji} | PnL: {pnl_str}")
+
+    # Remove settled trades from pending
+    state.pending_paper_trades = [t for t in state.pending_paper_trades if t.session_id != old_session_id]
+
+    # Summary
+    wr = 100 * state.trades_won / (state.trades_won + state.trades_lost) if (state.trades_won + state.trades_lost) > 0 else 0
+    state.log("")
+    state.log(f"SESSION STATS:")
+    state.log(f"  Trades settled: {len(session_trades)}")
+    state.log(f"  Total W/L:      {state.trades_won}/{state.trades_lost}")
+    state.log(f"  Win Rate:       {wr:.1f}%")
+    state.log(f"  Running PnL:    ${state.pnl_total:+.2f}")
+    state.log(f"{'='*50}")
+    state.log("")
+
+
+# ============================================================
+# UI COMPONENTS
+# ============================================================
+
+def make_header():
+    s = state.session
+
+    # Session countdown timer
+    tau_mins = int(s.tau // 60)
+    tau_secs = int(s.tau % 60)
+    elapsed_mins = int(s.elapsed // 60)
+    elapsed_secs = int(s.elapsed % 60)
+
+    # Format: 14:32 → 00:00 | Elapsed 0:28 | T=28
+    countdown_fmt = f"{tau_mins:02d}:{tau_secs:02d}"
+    elapsed_fmt = f"{elapsed_mins}:{elapsed_secs:02d}"
+
+    # Color countdown based on zone
+    if s.zone == "CORE":
+        timer_style = "bold green"
+    elif s.zone == "RECOVERY":
+        timer_style = "bold yellow"
+    elif s.zone == "DEAD":
+        timer_style = "red"
+    else:
+        timer_style = "white"
+
+    grid = Table.grid(expand=True)
+    grid.add_column(justify="left", ratio=1)
+    grid.add_column(justify="center", ratio=2)
+    grid.add_column(justify="right", ratio=1)
+
+    # Connection and mode status
+    if state.connected:
+        # MODE indicator
+        if is_real_mode():
+            mode_str = "[bold red]REAL[/]"
+        else:
+            mode_str = "[yellow]PAPER[/]"
+
+        # EXEC indicator (only relevant in real mode)
+        if is_real_mode():
+            if is_execution_enabled():
+                exec_str = "[bold green on dark_green] EXEC:ON [/]"
+            else:
+                exec_str = "[bold white on red] EXEC:OFF [/]"
+        else:
+            exec_str = ""
+
+        # Kill switch indicator
+        if state.executor and state.executor.kill_switch:
+            kill_str = " [bold red blink]KILL[/]"
+        else:
+            kill_str = ""
+
+        # Live trade limit indicator
+        if is_real_mode():
+            max_trades = state.max_live_trades_per_run
+            used = state.live_trades_this_run
+            if max_trades == 0:
+                limit_str = f" [dim]({used}/∞)[/]"
+            elif used >= max_trades:
+                limit_str = f" [red]({used}/{max_trades})[/]"
+            else:
+                limit_str = f" [dim]({used}/{max_trades})[/]"
+        else:
+            limit_str = ""
+
+        status = f"[bold green]LIVE[/] {mode_str}{exec_str}{kill_str}{limit_str}"
+    else:
+        status = "[red]DISCONNECTED[/]"
+
+    pnl_color = "green" if state.pnl_total >= 0 else "red"
+    settled = state.trades_won + state.trades_lost
+    pending = len(state.pending_paper_trades)
+    wr = int(100 * state.trades_won / settled) if settled > 0 else 0
+
+    # Wallet short address
+    wallet = CREDENTIALS["wallet_address"]
+    wallet_short = f"{wallet[:6]}...{wallet[-4:]}" if wallet else "---"
+
+    # Build stats string
+    stats_str = (
+        f"[bold]S:[/]{state.sessions_seen}({state.sessions_skipped}skip) | "
+        f"[bold]T:[/]{state.trades_total}({pending}pend) | "
+        f"[bold]W/L:[/][green]{state.trades_won}[/]/[red]{state.trades_lost}[/]({wr}%) | "
+        f"[bold]PnL:[/][{pnl_color}]${state.pnl_total:+.2f}[/]"
+    )
+
+    grid.add_row(
+        f"[bold cyan]RULEV3+[/] {status}",
+        stats_str,
+        f"[{timer_style}]{countdown_fmt}[/] | E={elapsed_fmt} | T={int(s.tau)}"
+    )
+
+    return Panel(grid, style="white on dark_blue", height=3)
+
+
+def make_live_prices():
+    s = state.session
+    table = Table(box=box.SIMPLE, expand=True, show_header=True)
+    table.add_column("Sym", style="cyan", width=5)
+    table.add_column("UP Bid", justify="right", width=8)
+    table.add_column("UP Ask", justify="right", width=8)
+    table.add_column("DOWN Bid", justify="right", width=8)
+    table.add_column("DOWN Ask", justify="right", width=8)
+    table.add_column("Edge", justify="right", width=10)
+    table.add_column("Dir", justify="center", width=6)
+
+    up_bid = s.up.best_bid or 0
+    up_ask = s.up.best_ask or 0
+    down_bid = s.down.best_bid or 0
+    down_ask = s.down.best_ask or 0
+
+    # Use connector's edge value (correctly handles missing bid/ask)
+    edge = s.edge
+    edge_dir = s.edge_direction.upper() if s.edge_direction else "---"
+
+    # Edge color based on RULEV3+ threshold
+    if edge >= 0.64:
+        edge_fmt = f"[bold green]{edge:.3f}[/]"
+        dir_fmt = f"[bold green]{edge_dir}[/]"
+    elif edge >= 0.60:
+        edge_fmt = f"[yellow]{edge:.3f}[/]"
+        dir_fmt = f"[yellow]{edge_dir}[/]"
+    else:
+        edge_fmt = f"[dim]{edge:.3f}[/]"
+        dir_fmt = f"[dim]{edge_dir}[/]"
+
+    table.add_row(
+        "BTC",
+        f"[green]{up_bid:.2f}[/]",
+        f"{up_ask:.2f}",
+        f"[red]{down_bid:.2f}[/]",
+        f"{down_ask:.2f}",
+        edge_fmt,
+        dir_fmt
+    )
+
+    return Panel(table, title="[bold]LIVE PRICES - BTC 15m[/]", border_style="blue")
+
+
+def make_session_info():
+    s = state.session
+
+    # Session times
+    if s.session_start_ts > 0:
+        start_dt = datetime.fromtimestamp(s.session_start_ts)
+        end_dt = datetime.fromtimestamp(s.session_end_ts)
+        session_time_str = f"{start_dt.strftime('%H:%M:%S')} - {end_dt.strftime('%H:%M:%S')}"
+    else:
+        session_time_str = "---"
+
+    # Format elapsed and tau as M:SS
+    elapsed_mins = int(s.elapsed // 60)
+    elapsed_secs = int(s.elapsed % 60)
+    elapsed_fmt = f"{elapsed_mins}:{elapsed_secs:02d}"
+
+    tau_mins = int(s.tau // 60)
+    tau_secs = int(s.tau % 60)
+    tau_fmt = f"{tau_mins}:{tau_secs:02d}"
+
+    # Zone with color
+    zone = s.zone
+    if zone == "CORE":
+        zone_fmt = "[bold green]CORE (3:00-3:29)[/]"
+    elif zone == "RECOVERY":
+        zone_fmt = "[bold yellow]RECOVERY (5:00-5:59)[/]"
+    elif zone == "DEAD":
+        zone_fmt = "[red]DEAD (3:30-4:59)[/]"
+    elif zone == "EARLY":
+        zone_fmt = "[dim]EARLY (0:00-2:59)[/]"
+    else:
+        zone_fmt = "[dim]LATE (6:00+)[/]"
+
+    # Signal check - RULEV3+ logic
+    signal = "WAITING"
+    signal_style = "dim"
+    if s.zone in ["CORE", "RECOVERY"]:
+        if s.edge >= CONFIG["threshold"]:
+            ask = s.up.best_ask if s.edge_direction == "Up" else s.down.best_ask
+            if ask and ask < CONFIG["safety_cap"]:
+                signal = f"BUY {s.edge_direction.upper()} @ {ask:.2f}"
+                signal_style = "bold green"
+            elif ask:
+                signal = f"SAFETY CAP: {ask:.2f} >= {CONFIG['safety_cap']}"
+                signal_style = "yellow"
+        else:
+            signal = f"NO EDGE: {s.edge:.2f} < {CONFIG['threshold']}"
+            signal_style = "dim"
+    elif s.zone == "DEAD":
+        signal = "DEAD ZONE - NO TRADE"
+        signal_style = "red"
+    elif s.zone == "LATE":
+        signal = "TOO LATE"
+        signal_style = "dim"
+
+    content = Table.grid(padding=(0, 2))
+    content.add_column(width=12)
+    content.add_column(justify="left")
+
+    content.add_row("Session ID:", f"[cyan]{s.slug if s.slug else '---'}[/]")
+    content.add_row("Time:", f"[white]{session_time_str}[/]")
+    content.add_row("Elapsed:", f"[bold]{elapsed_fmt}[/] into session")
+    content.add_row("Remaining:", f"[bold]{tau_fmt}[/] (Polymarket timer)")
+    content.add_row("Zone:", zone_fmt)
+    content.add_row("", "")
+    content.add_row("SIGNAL:", f"[{signal_style}]{signal}[/]")
+
+    # Executor status
+    if state.executor and state.executor_connected:
+        # Cooldown check
+        if state.executor.last_trade_time:
+            cooldown_elapsed = (datetime.now() - state.executor.last_trade_time).total_seconds()
+            cooldown_remaining = state.executor.config.cooldown_seconds - cooldown_elapsed
+            if cooldown_remaining > 0:
+                content.add_row("Cooldown:", f"[yellow]{cooldown_remaining:.0f}s[/]")
+            else:
+                content.add_row("Cooldown:", "[green]Ready[/]")
+        else:
+            content.add_row("Cooldown:", "[green]Ready[/]")
+
+        # Zone trades
+        core_trades = state.executor.session_trades.get("CORE", 0)
+        recovery_trades = state.executor.session_trades.get("RECOVERY", 0)
+        max_per_zone = state.executor.config.max_trades_per_zone
+        content.add_row("Session:", f"CORE {core_trades}/{max_per_zone}  REC {recovery_trades}/{max_per_zone}")
+
+    # Last order
+    if state.last_order:
+        o = state.last_order
+        if o.status == OrderStatus.FILLED:
+            order_str = f"[green]FILLED {o.direction} @ {o.fill_price:.2f}[/]"
+        elif o.status == OrderStatus.DEGRADED:
+            order_str = f"[yellow]DEGRADED {o.direction} (slip: {o.slippage_bps:.0f}bps)[/]"
+        elif o.status == OrderStatus.CANCELLED:
+            order_str = f"[dim]CANCELLED {o.direction}[/]"
+        elif o.status == OrderStatus.FAILED:
+            order_str = f"[red]FAILED: {o.error}[/]"
+        else:
+            order_str = f"[dim]{o.status.value}[/]"
+        content.add_row("Last Order:", order_str)
+
+    return Panel(content, title="[bold]SESSION - RULEV3+[/]", border_style="cyan")
+
+
+def make_performance():
+    settled = state.trades_won + state.trades_lost
+    pending = len(state.pending_paper_trades)
+    total = state.trades_total
+    wr = 100 * state.trades_won / settled if settled else 0
+    ev = state.pnl_total / settled if settled else 0
+
+    content = Table.grid(padding=(0, 2))
+    content.add_column()
+    content.add_column(justify="right")
+
+    content.add_row("Trades:", f"[bold]{total}[/] ({pending} pending)")
+    content.add_row("Settled:", f"[bold]{settled}[/]")
+    content.add_row("Won:", f"[green]{state.trades_won}[/]")
+    content.add_row("Lost:", f"[red]{state.trades_lost}[/]")
+    content.add_row("Win Rate:", f"[bold]{wr:.1f}%[/]")
+    content.add_row("EV/Trade:", f"[cyan]${ev:+.2f}[/]")
+    content.add_row("Total PnL:", f"[{'green' if state.pnl_total >= 0 else 'red'}]${state.pnl_total:+.2f}[/]")
+
+    # Label as simulated in paper mode
+    if not is_real_mode():
+        title = "[bold]PERFORMANCE[/] [dim](SIMULATED)[/]"
+    else:
+        title = "[bold]PERFORMANCE[/]"
+
+    return Panel(content, title=title, border_style="green")
+
+
+def make_zones():
+    content = Table.grid(padding=(0, 2))
+    content.add_column()
+    content.add_column(justify="right")
+
+    content.add_row("[green]CORE[/] entries:", f"{state.core_entries}")
+    content.add_row("[yellow]RECOVERY[/] entries:", f"{state.recovery_entries}")
+    content.add_row("Sessions seen:", f"{state.sessions_seen}")
+    content.add_row("Sessions skipped:", f"{state.sessions_skipped}")
+
+    return Panel(content, title="[bold]ZONES[/]", border_style="yellow")
+
+
+def make_config():
+    content = Table.grid(padding=(0, 1))
+    content.add_column()
+    content.add_column(justify="right")
+
+    content.add_row("Strategy:", f"[cyan]{CONFIG['strategy']}[/]")
+    content.add_row("Mode:", CONFIG['mode'])
+    content.add_row("CORE:", CONFIG['core_window'])
+    content.add_row("RECOVERY:", CONFIG['recovery_window'])
+    content.add_row("Threshold:", f">= {CONFIG['threshold']}")
+    content.add_row("Safety Cap:", f"< {CONFIG['safety_cap']}")
+    content.add_row("", "")
+    content.add_row("Trade Size:", f"[green]${CONFIG['cash_per_trade']:.2f}[/]")
+    content.add_row("Max Position:", f"[green]${CONFIG['max_position']:.2f}[/]")
+
+    return Panel(content, title="[bold]CONFIG[/]", border_style="magenta")
+
+
+def make_book_depth():
+    s = state.session
+
+    content = Table.grid(padding=(0, 2))
+    content.add_column()
+    content.add_column(justify="right")
+    content.add_column(justify="right")
+
+    content.add_row("", "[green]UP[/]", "[red]DOWN[/]")
+    content.add_row("Best Bid:", f"{s.up.best_bid or 0:.2f}", f"{s.down.best_bid or 0:.2f}")
+    content.add_row("Best Ask:", f"{s.up.best_ask or 0:.2f}", f"{s.down.best_ask or 0:.2f}")
+    content.add_row("Mid:", f"{s.up.mid or 0:.2f}", f"{s.down.mid or 0:.2f}")
+    content.add_row("Depth Bid:", f"{s.up.depth_bid:.0f}", f"{s.down.depth_bid:.0f}")
+    content.add_row("Depth Ask:", f"{s.up.depth_ask:.0f}", f"{s.down.depth_ask:.0f}")
+
+    return Panel(content, title="[bold]ORDER BOOK[/]", border_style="blue")
+
+
+def make_logs():
+    log_text = "\n".join(list(state.logs)[-18:]) if state.logs else "[dim]Connecting...[/]"
+    return Panel(log_text, title="[bold]LOGS[/]", border_style="dim")
+
+
+# ============================================================
+# LAYOUT
+# ============================================================
+
+def make_layout():
+    layout = Layout()
+
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="main", ratio=1),
+        Layout(name="logs", size=14),
+    )
+
+    layout["main"].split_row(
+        Layout(name="left", ratio=2),
+        Layout(name="right", ratio=1),
+    )
+
+    layout["left"].split_column(
+        Layout(name="prices", size=6),
+        Layout(name="book", size=10),
+        Layout(name="session", ratio=1),
+    )
+
+    layout["right"].split_column(
+        Layout(name="performance", size=10),
+        Layout(name="zones", size=8),
+        Layout(name="config", ratio=1),
+    )
+
+    return layout
+
+
+def update_layout(layout):
+    layout["header"].update(make_header())
+    layout["prices"].update(make_live_prices())
+    layout["book"].update(make_book_depth())
+    layout["session"].update(make_session_info())
+    layout["performance"].update(make_performance())
+    layout["zones"].update(make_zones())
+    layout["config"].update(make_config())
+    layout["logs"].update(make_logs())
+
+
+# ============================================================
+# EXECUTOR INTEGRATION
+# ============================================================
+
+def init_executor() -> Optional[TradeExecutor]:
+    """Initialize the trade executor."""
+    private_key = CREDENTIALS["private_key"]
+    funder = CREDENTIALS["funder_address"]
+    sig_type = CREDENTIALS["signature_type"]
+
+    if not private_key:
+        state.log("No private key - executor disabled")
+        return None
+
+    config = ExecutorConfig(
+        cash_per_trade=CONFIG["cash_per_trade"],
+        edge_threshold=CONFIG["threshold"],
+        safety_cap=CONFIG["safety_cap"],
+    )
+
+    executor = TradeExecutor(
+        private_key=private_key,
+        funder=funder,
+        signature_type=sig_type,
+        config=config
+    )
+    executor.on_log = lambda msg: state.log(f"[EXEC] {msg}")
+    executor.on_order_update = on_order_update
+
+    return executor
+
+
+def on_order_update(result: OrderResult):
+    """Handle order status updates."""
+    state.last_order = result
+
+    if result.status in [OrderStatus.FILLED, OrderStatus.DEGRADED]:
+        state.trades_total += 1
+        if result.zone == "CORE":
+            state.core_entries += 1
+        elif result.zone == "RECOVERY":
+            state.recovery_entries += 1
+
+        # Update balance from executor
+        if state.executor:
+            state.usdc_balance = state.executor.balance
+
+
+def get_current_state():
+    """Get current (zone, edge, ask) for retry validation."""
+    s = state.session
+    ask = s.up.best_ask if s.edge_direction == "Up" else s.down.best_ask
+    return (s.zone, s.edge, ask or 0)
+
+
+async def check_and_execute_signal():
+    """Check if RULEV3+ signal is valid and execute trade."""
+    s = state.session
+    executor = state.executor
+
+    if not executor or not executor.connected:
+        return
+
+    # Already have a pending order?
+    if state.pending_order:
+        return
+
+    # Kill switch active?
+    if executor.kill_switch:
+        return
+
+    # Not in trading zone?
+    if s.zone not in ["CORE", "RECOVERY"]:
+        return
+
+    # Check for new session
+    session_id = s.slug or ""
+    if session_id and session_id != state.current_session_id:
+        if state.current_session_id:
+            state.log(f"[SESSION] New session detected")
+            state.log(f"[SESSION] Old: {state.current_session_id}")
+            state.log(f"[SESSION] New: {session_id}")
+        state.current_session_id = session_id
+        executor.new_session(session_id)
+        state.log(f"[SESSION] Zone counters reset: CORE=0, RECOVERY=0")
+
+    # Edge threshold check
+    if s.edge < CONFIG["threshold"]:
+        return
+
+    # Get direction and ask price
+    direction = s.edge_direction
+    if direction == "Up":
+        ask = s.up.best_ask
+        token_id = s.token_up
+    else:
+        ask = s.down.best_ask
+        token_id = s.token_down
+
+    if not ask or ask <= 0:
+        return
+
+    if not token_id:
+        state.log(f"[ERROR] No token_id for {direction}")
+        return
+
+    # Safety cap check
+    if ask >= CONFIG["safety_cap"]:
+        return
+
+    # Validate signal
+    valid, reason = executor.validate_signal(s.zone, direction, s.edge, ask)
+    if not valid:
+        return
+
+    # All checks passed - execute!
+    state.log(f"[SIGNAL] {s.zone} {direction} edge={s.edge:.3f} ask={ask:.2f}")
+
+    if is_execution_enabled():
+        # REAL EXECUTION - check live trade limit first (0 = unlimited)
+        if state.max_live_trades_per_run > 0 and state.live_trades_this_run >= state.max_live_trades_per_run:
+            state.log(f"[BLOCKED] Live trade limit reached ({state.live_trades_this_run}/{state.max_live_trades_per_run})")
+            # Still update executor state to prevent repeated attempts
+            executor.session_trades[s.zone] = executor.session_trades.get(s.zone, 0) + 1
+            executor.last_trade_time = datetime.now()
+            return
+
+        state.log(f"[REAL] Executing {direction} @ {ask:.2f}")
+        result = await executor.execute_trade(
+            token_id=token_id,
+            direction=direction,
+            price=ask,
+            zone=s.zone,
+            edge=s.edge,
+            get_current_state=get_current_state
+        )
+        state.pending_order = None
+
+        # Increment live trade counter on successful submission
+        if result.status in [OrderStatus.FILLED, OrderStatus.DEGRADED, OrderStatus.SUBMITTED]:
+            state.live_trades_this_run += 1
+            state.log(f"[REAL] Live trades: {state.live_trades_this_run}/{state.max_live_trades_per_run}")
+
+    elif is_real_mode():
+        # Real mode but EXECUTION_ENABLED=false - blocked
+        state.log(f"[BLOCKED] EXEC:OFF - Would BUY {direction} @ {ask:.2f}")
+        # Update executor state to prevent spam
+        executor.session_trades[s.zone] = executor.session_trades.get(s.zone, 0) + 1
+        executor.last_trade_time = datetime.now()
+
+    else:
+        # Paper mode - log it and update executor state to prevent double-fire
+        global session_had_trade
+        session_had_trade = True  # Mark this session as having a trade
+
+        shares = CONFIG["cash_per_trade"] / ask
+        potential_profit = (1.0 - ask) * shares
+        potential_loss = CONFIG["cash_per_trade"]  # We lose our cost
+        trade_time = datetime.now()
+
+        # Calculate EV: edge * potential_win - (1-edge) * potential_loss
+        # Edge is the mid price of stronger side, represents implied probability
+        ev_per_trade = s.edge * potential_profit - (1 - s.edge) * potential_loss
+
+        # CRITICAL: Update executor state even in paper mode to prevent double-fire
+        executor.session_trades[s.zone] = executor.session_trades.get(s.zone, 0) + 1
+        executor.last_trade_time = trade_time
+
+        # Update UI stats
+        if s.zone == "CORE":
+            state.core_entries += 1
+        else:
+            state.recovery_entries += 1
+        state.trades_total += 1
+
+        # Create paper trade for tracking
+        paper_trade = PaperTrade(
+            trade_id=state.trades_total,
+            session_id=s.slug or "",
+            direction=direction,
+            entry_price=ask,
+            shares=shares,
+            cost=CONFIG["cash_per_trade"],
+            potential_win=potential_profit,
+            potential_loss=potential_loss,
+            zone=s.zone,
+            timestamp=trade_time
+        )
+        state.pending_paper_trades.append(paper_trade)
+
+        # Check bid liquidity - is there enough on the bid side?
+        if direction == "Up":
+            bid_price = s.up.best_bid or 0
+        else:
+            bid_price = s.down.best_bid or 0
+        spread = ask - bid_price if bid_price else 0
+        fill_status = "FILLED" if spread < 0.05 else "WIDE SPREAD"
+
+        # Structured paper trade log
+        state.log(f"")
+        state.log(f"{'='*50}")
+        state.log(f"PAPER TRADE #{state.trades_total}")
+        state.log(f"{'='*50}")
+        state.log(f"TIME:      {trade_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
+        state.log(f"SESSION:   {s.slug}")
+        state.log(f"ZONE:      {s.zone}")
+        state.log(f"DIRECTION: {direction}")
+        state.log(f"FILL:      {fill_status} (spread: ${spread:.4f})")
+        state.log(f"EDGE:      {s.edge:.4f}")
+        state.log(f"ASK:       ${ask:.4f}")
+        state.log(f"BID:       ${bid_price:.4f}")
+        state.log(f"SHARES:    {shares:.4f}")
+        state.log(f"COST:      ${CONFIG['cash_per_trade']:.2f}")
+        state.log(f"IF_WIN:    +${potential_profit:.2f}")
+        state.log(f"IF_LOSE:   -${potential_loss:.2f}")
+        state.log(f"EV/TRADE:  ${ev_per_trade:+.2f}")
+        state.log(f"TOKEN:     {token_id}")
+        state.log(f"UP:        bid=${s.up.best_bid or 0:.4f} ask=${s.up.best_ask or 0:.4f}")
+        state.log(f"DOWN:      bid=${s.down.best_bid or 0:.4f} ask=${s.down.best_ask or 0:.4f}")
+        state.log(f"TAU:       {s.tau:.1f}s")
+        state.log(f"ELAPSED:   {s.elapsed:.1f}s")
+        state.log(f"ZONE_CNT:  {s.zone}={executor.session_trades[s.zone]}/{executor.config.max_trades_per_zone}")
+        state.log(f"PENDING:   {len(state.pending_paper_trades)} trades awaiting settlement")
+        state.log(f"STATS:     W:{state.trades_won} L:{state.trades_lost} PnL:${state.pnl_total:+.2f}")
+        state.log(f"{'='*50}")
+        state.log(f"")
+
+
+# ============================================================
+# CALLBACKS
+# ============================================================
+
+last_slug = ""
+last_up_price = 0.5
+last_down_price = 0.5
+session_had_trade = False  # Track if current session had a trade
+
+def on_market_update(session_state: SessionState):
+    global last_slug, last_up_price, last_down_price, session_had_trade
+
+    # BEFORE updating state, check for session change and settle pending trades
+    if session_state.slug and session_state.slug != last_slug:
+        # Session is changing!
+        if last_slug:
+            # Check if old session had any trades
+            if not session_had_trade:
+                state.sessions_skipped += 1
+                state.log(f"[SESSION] Skipped (no signal): {last_slug}")
+
+            # Settle any pending paper trades from old session
+            if state.pending_paper_trades:
+                # Use the LAST known prices from old session
+                settle_paper_trades(last_slug, last_up_price, last_down_price)
+
+        state.sessions_seen += 1
+        session_had_trade = False  # Reset for new session
+        last_slug = session_state.slug
+
+    # Update state with new session data
+    state.session = session_state
+    state.connected = session_state.connected
+    state.last_update = datetime.now()
+
+    # Store current prices for settlement on next session change
+    if session_state.up.best_bid:
+        last_up_price = (session_state.up.best_bid + (session_state.up.best_ask or session_state.up.best_bid)) / 2
+    if session_state.down.best_bid:
+        last_down_price = (session_state.down.best_bid + (session_state.down.best_ask or session_state.down.best_bid)) / 2
+
+
+def on_log(msg: str):
+    state.log(msg)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def run_dashboard():
+    console = Console()
+    layout = make_layout()
+
+    # Initialize log file - separate folders for real/paper
+    base_logs_dir = Path(__file__).parent / "logs"
+    if is_real_mode():
+        logs_dir = base_logs_dir / "real"
+    else:
+        logs_dir = base_logs_dir / "paper"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_filename = f"trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    state.log_file = str(logs_dir / log_filename)
+
+    state.log("RULEV3+ Live Dashboard starting...")
+    state.log(f"Log file: {log_filename}")
+    state.log(f"Strategy: {CONFIG['strategy']} v{CONFIG['version']}")
+    state.log(f"Mode: {CONFIG['mode']}")
+
+    # Initialize safety limiters
+    state.max_live_trades_per_run = CREDENTIALS["max_live_trades_per_run"]
+    state.live_trades_this_run = 0
+
+    # Show trading mode and fetch initial balance
+    wallet = CREDENTIALS["wallet_address"]
+    wallet_short = f"{wallet[:6]}...{wallet[-4:]}" if len(wallet) > 10 else "???"
+
+    if is_real_mode():
+        state.log(f"REAL MODE - Wallet: {wallet_short}")
+        if is_execution_enabled():
+            state.log(f"EXEC:ON - Live trades enabled (max {state.max_live_trades_per_run}/run)")
+        else:
+            state.log(f"EXEC:OFF - Orders will be BLOCKED until EXECUTION_ENABLED=true")
+    else:
+        state.log(f"PAPER MODE - Wallet: {wallet_short}")
+
+    # RESTART WARNING - session state does NOT persist
+    state.log("[WARN] Session state resets on restart (zone counters = 0)")
+
+    # Initialize trade executor
+    state.log("Initializing trade executor...")
+    state.executor = init_executor()
+
+    if state.executor:
+        if state.executor.connect():
+            state.executor_connected = True
+            state.usdc_balance = state.executor.refresh_balance()
+            state.log(f"Executor connected - Balance: ${state.usdc_balance:.2f}")
+        else:
+            state.log("Executor connection failed - running in monitor mode")
+    else:
+        # No executor - fetch balance directly
+        state.log("Fetching Polymarket balance...")
+        state.usdc_balance = fetch_usdc_balance()
+
+    state.last_balance_check = datetime.now()
+    state.log(f"Balance: ${state.usdc_balance:.2f} USDC")
+
+    state.log("Connecting to Polymarket WebSocket...")
+
+    # Start session manager
+    manager = SessionManager()
+    manager.on_update = on_market_update
+    manager.on_log = on_log
+
+    # Run manager in background
+    manager_task = asyncio.create_task(manager.start())
+
+    try:
+        with Live(layout, console=console, refresh_per_second=4, screen=True):
+            while True:
+                update_layout(layout)
+
+                # Check for trading signals
+                await check_and_execute_signal()
+
+                # Refresh balance every 60 seconds
+                if state.last_balance_check:
+                    elapsed = (datetime.now() - state.last_balance_check).total_seconds()
+                    if elapsed > 60:
+                        if state.executor and state.executor_connected:
+                            state.usdc_balance = state.executor.refresh_balance()
+                        else:
+                            state.usdc_balance = fetch_usdc_balance()
+                        state.last_balance_check = datetime.now()
+
+                # Periodic stats log every 5 minutes
+                runtime_mins = (datetime.now() - state.start_time).total_seconds() / 60
+                if runtime_mins > 0 and int(runtime_mins) % 5 == 0 and int(runtime_mins) != getattr(state, '_last_stats_log', 0):
+                    state._last_stats_log = int(runtime_mins)
+                    settled = state.trades_won + state.trades_lost
+                    pending = len(state.pending_paper_trades)
+                    wr = 100 * state.trades_won / settled if settled > 0 else 0
+                    ev = state.pnl_total / settled if settled > 0 else 0
+                    state.log(f"[STATS] {int(runtime_mins)}m | Sessions: {state.sessions_seen} (skip:{state.sessions_skipped}) | Trades: {state.trades_total} (pend:{pending}) | W/L: {state.trades_won}/{state.trades_lost} ({wr:.0f}%) | EV: ${ev:+.2f} | PnL: ${state.pnl_total:+.2f}")
+
+                await asyncio.sleep(0.25)
+    except KeyboardInterrupt:
+        state.log("Shutdown requested...")
+
+        # Final session summary
+        runtime_mins = (datetime.now() - state.start_time).total_seconds() / 60
+        settled = state.trades_won + state.trades_lost
+        pending = len(state.pending_paper_trades)
+        wr = 100 * state.trades_won / settled if settled > 0 else 0
+        ev = state.pnl_total / settled if settled > 0 else 0
+
+        state.log("")
+        state.log("=" * 50)
+        state.log("FINAL SESSION SUMMARY")
+        state.log("=" * 50)
+        state.log(f"Runtime:        {int(runtime_mins)} minutes")
+        state.log(f"Sessions seen:  {state.sessions_seen}")
+        state.log(f"Sessions skip:  {state.sessions_skipped}")
+        state.log(f"Total trades:   {state.trades_total}")
+        state.log(f"CORE entries:   {state.core_entries}")
+        state.log(f"RECOV entries:  {state.recovery_entries}")
+        state.log(f"Settled:        {settled}")
+        state.log(f"Wins:           {state.trades_won}")
+        state.log(f"Losses:         {state.trades_lost}")
+        state.log(f"Win Rate:       {wr:.1f}%")
+        state.log(f"EV/Trade:       ${ev:+.2f}")
+        state.log(f"Total PnL:      ${state.pnl_total:+.2f}")
+        state.log(f"Pending:        {pending} unsettled trades")
+        state.log("=" * 50)
+
+        if state.executor:
+            await state.executor.cancel_all()
+        manager.stop()
+        await asyncio.sleep(0.5)
+        print("\nDashboard stopped.")
+
+
+def main():
+    asyncio.run(run_dashboard())
+
+
+if __name__ == "__main__":
+    main()
