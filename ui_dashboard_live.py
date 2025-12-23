@@ -1038,6 +1038,17 @@ async def run_dashboard():
                     ev = state.pnl_total / settled if settled > 0 else 0
                     state.log(f"[STATS] {int(runtime_mins)}m | Sessions: {state.sessions_seen} (skip:{state.sessions_skipped}) | Trades: {state.trades_total} (pend:{pending}) | W/L: {state.trades_won}/{state.trades_lost} ({wr:.0f}%) | EV: ${ev:+.2f} | PnL: ${state.pnl_total:+.2f}")
 
+                # Periodic price/status log every 30 seconds for paper mode monitoring
+                runtime_secs = int((datetime.now() - state.start_time).total_seconds())
+                if runtime_secs > 0 and runtime_secs % 30 == 0 and runtime_secs != getattr(state, '_last_price_log', 0):
+                    state._last_price_log = runtime_secs
+                    s = state.session
+                    up_bid = s.up.best_bid or 0
+                    up_ask = s.up.best_ask or 0
+                    down_bid = s.down.best_bid or 0
+                    down_ask = s.down.best_ask or 0
+                    state.log(f"[LIVE] Zone:{s.zone} T={int(s.tau)}s | UP:{up_bid:.2f}/{up_ask:.2f} DOWN:{down_bid:.2f}/{down_ask:.2f} | Edge:{s.edge:.3f} {s.edge_direction}")
+
                 await asyncio.sleep(0.25)
     except KeyboardInterrupt:
         state.log("Shutdown requested...")
