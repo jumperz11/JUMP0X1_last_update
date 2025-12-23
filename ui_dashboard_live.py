@@ -131,14 +131,37 @@ def fetch_usdc_balance():
 # CONFIG
 # ============================================================
 
+# Zone mode: "T3-only" = CORE only, "T3+T5" = CORE + RECOVERY
+ZONE_MODE = os.getenv("PM_ZONE_MODE", "T3-only")
+
+# Map mode to allowed zones (T3 = minute 3 = CORE zone)
+ALLOWED_ZONES = {
+    "T3-only": ["CORE"],
+    "T3+T5": ["CORE", "RECOVERY"],
+    "all": ["CORE", "RECOVERY"],
+}
+
 CONFIG = {
     "strategy": "RULEV3+",
-    "version": "1.0",
-    "mode": "T3-only",
+    "version": "1.1",  # Version bump for gate fixes
+    "mode": ZONE_MODE,
+    "allowed_zones": ALLOWED_ZONES.get(ZONE_MODE, ["CORE"]),
     "core_window": "3:00-3:29",
     "recovery_window": "5:00-5:59",
+
+    # EDGE GATE: Minimum mid-price (legacy threshold)
     "threshold": float(os.getenv("PM_EDGE_THRESHOLD", "0.64")),
+
+    # PRICE GATE: Maximum ask price
     "safety_cap": float(os.getenv("PM_SAFETY_CAP", "0.72")),
+
+    # ALPHA GATE: Minimum edge over ask (edge - ask >= margin)
+    "alpha_margin": float(os.getenv("PM_ALPHA_MARGIN", "0.02")),
+
+    # SESSION GATE: Max trades per session (total, not per zone)
+    "max_trades_per_session": int(os.getenv("PM_MAX_TRADES_PER_SESSION", "1")),
+
+    # Trade sizing
     "cash_per_trade": float(os.getenv("PM_CASH_PER_TRADE", "1.00")),
     "max_position": float(os.getenv("PM_MAX_POSITION", "8.00")),
 }
@@ -186,6 +209,9 @@ class DashboardState:
     # Safety limiters
     live_trades_this_run: int = 0  # Counter for MAX_LIVE_TRADES_PER_RUN
     max_live_trades_per_run: int = 1  # From .env
+
+    # Session trade counter (reset on session change)
+    session_trade_count: int = 0  # Total trades this session (not per zone)
 
     # Paper trade tracking for win/loss settlement
     pending_paper_trades: List[PaperTrade] = field(default_factory=list)
@@ -720,7 +746,16 @@ def get_current_state():
 
 
 async def check_and_execute_signal():
-    """Check if RULEV3+ signal is valid and execute trade."""
+    """Check if RULEV3+ signal is valid and execute trade.
+
+    GATES (in order):
+    1. MODE_ZONE_GATE: T3-only means only CORE zone
+    2. BOOK_GATE: Must have valid bid/ask
+    3. SESSION_CAP: Max 1 trade per session (total)
+    4. EDGE_GATE: edge >= threshold
+    5. PRICE_GATE: ask < safety_cap
+    6. ALPHA_GATE: edge >= ask + margin (the killer gate)
+    """
     s = state.session
     executor = state.executor
 
@@ -735,52 +770,88 @@ async def check_and_execute_signal():
     if executor.kill_switch:
         return
 
-    # Not in trading zone?
-    if s.zone not in ["CORE", "RECOVERY"]:
-        return
+    # ============================================================
+    # GATE 1: MODE_ZONE_GATE - T3-only means only CORE zone
+    # ============================================================
+    allowed_zones = CONFIG.get("allowed_zones", ["CORE"])
+    if s.zone not in allowed_zones:
+        return  # Silent skip for non-trading zones
 
-    # Check for new session
+    # Check for new session - reset counters
     session_id = s.slug or ""
     if session_id and session_id != state.current_session_id:
         if state.current_session_id:
-            state.log(f"[SESSION] New session detected")
-            state.log(f"[SESSION] Old: {state.current_session_id}")
             state.log(f"[SESSION] New: {session_id}")
         state.current_session_id = session_id
+        state.session_trade_count = 0  # Reset session trade counter
         executor.new_session(session_id)
-        state.log(f"[SESSION] Zone counters reset: CORE=0, RECOVERY=0")
+        state.log(f"[SESSION] Counters reset: session_trades=0")
 
-    # Edge threshold check
-    if s.edge < CONFIG["threshold"]:
-        return
-
-    # Get direction and ask price
+    # Get direction and prices
     direction = s.edge_direction
     if direction == "Up":
         ask = s.up.best_ask
+        bid = s.up.best_bid
         token_id = s.token_up
     else:
         ask = s.down.best_ask
+        bid = s.down.best_bid
         token_id = s.token_down
 
-    if not ask or ask <= 0:
-        return
+    # ============================================================
+    # GATE 2: BOOK_GATE - Must have valid bid/ask
+    # ============================================================
+    if bid is None or ask is None or bid <= 0 or ask <= 0:
+        return  # NO_BOOK - silent skip
 
     if not token_id:
-        state.log(f"[ERROR] No token_id for {direction}")
+        state.log(f"[GATE] NO_TOKEN for {direction}")
         return
 
-    # Safety cap check
+    # ============================================================
+    # GATE 3: SESSION_CAP - Max trades per session (total)
+    # ============================================================
+    max_per_session = CONFIG.get("max_trades_per_session", 1)
+    if state.session_trade_count >= max_per_session:
+        return  # SESSION_CAP - silent skip (already traded this session)
+
+    # ============================================================
+    # GATE 4: EDGE_GATE - edge >= threshold
+    # ============================================================
+    if s.edge < CONFIG["threshold"]:
+        return  # NO_EDGE - silent skip
+
+    # ============================================================
+    # GATE 5: PRICE_GATE - ask < safety_cap
+    # ============================================================
     if ask >= CONFIG["safety_cap"]:
+        return  # PRICE_CAP - silent skip
+
+    # ============================================================
+    # GATE 6: ALPHA_GATE - edge >= ask + margin (THE KEY GATE)
+    # ============================================================
+    alpha = s.edge - ask
+    alpha_margin = CONFIG.get("alpha_margin", 0.02)
+    if alpha < alpha_margin:
+        # Log this one since it's the most common filter
+        # state.log(f"[GATE] NO_ALPHA: edge={s.edge:.3f} ask={ask:.3f} alpha={alpha:.3f} < {alpha_margin}")
         return
 
-    # Validate signal
+    # ============================================================
+    # GATE 7: EXECUTOR VALIDATION (zone limits, cooldowns)
+    # ============================================================
     valid, reason = executor.validate_signal(s.zone, direction, s.edge, ask)
     if not valid:
+        state.log(f"[GATE] {reason}")
         return
 
-    # All checks passed - execute!
-    state.log(f"[SIGNAL] {s.zone} {direction} edge={s.edge:.3f} ask={ask:.2f}")
+    # ============================================================
+    # ALL GATES PASSED - Calculate EV and execute
+    # ============================================================
+    # EV = edge - ask (simplified, no fees)
+    ev_alpha = alpha  # This is our true edge
+
+    state.log(f"[SIGNAL] {s.zone} {direction} edge={s.edge:.3f} ask={ask:.2f} alpha={alpha:.3f}")
 
     if is_execution_enabled():
         # REAL EXECUTION - check live trade limit first (0 = unlimited)
@@ -805,6 +876,7 @@ async def check_and_execute_signal():
         # Increment live trade counter on successful submission
         if result.status in [OrderStatus.FILLED, OrderStatus.DEGRADED, OrderStatus.SUBMITTED]:
             state.live_trades_this_run += 1
+            state.session_trade_count += 1  # Also increment session counter
             state.log(f"[REAL] Live trades: {state.live_trades_this_run}/{state.max_live_trades_per_run}")
 
     elif is_real_mode():
@@ -824,13 +896,16 @@ async def check_and_execute_signal():
         potential_loss = CONFIG["cash_per_trade"]  # We lose our cost
         trade_time = datetime.now()
 
-        # Calculate EV: edge * potential_win - (1-edge) * potential_loss
-        # Edge is the mid price of stronger side, represents implied probability
-        ev_per_trade = s.edge * potential_profit - (1 - s.edge) * potential_loss
+        # FIXED EV: EV = edge - ask (our alpha, simplified no fees)
+        # This is the correct formula: if we think prob=edge and pay ask, EV = edge - ask
+        ev_per_trade = alpha  # alpha = edge - ask, calculated above
 
         # CRITICAL: Update executor state even in paper mode to prevent double-fire
         executor.session_trades[s.zone] = executor.session_trades.get(s.zone, 0) + 1
         executor.last_trade_time = trade_time
+
+        # INCREMENT SESSION TRADE COUNTER (key fix for session cap)
+        state.session_trade_count += 1
 
         # Update UI stats
         if s.zone == "CORE":
@@ -854,13 +929,13 @@ async def check_and_execute_signal():
         )
         state.pending_paper_trades.append(paper_trade)
 
-        # Check bid liquidity - is there enough on the bid side?
-        if direction == "Up":
-            bid_price = s.up.best_bid or 0
-        else:
-            bid_price = s.down.best_bid or 0
-        spread = ask - bid_price if bid_price else 0
+        # Check bid liquidity
+        spread = ask - bid if bid else 0
         fill_status = "FILLED" if spread < 0.05 else "WIDE SPREAD"
+
+        # Helper for safe price formatting
+        def fmt_px(x):
+            return f"${x:.4f}" if x is not None and x > 0 else "NA"
 
         # Structured paper trade log
         state.log(f"")
@@ -873,19 +948,20 @@ async def check_and_execute_signal():
         state.log(f"DIRECTION: {direction}")
         state.log(f"FILL:      {fill_status} (spread: ${spread:.4f})")
         state.log(f"EDGE:      {s.edge:.4f}")
-        state.log(f"ASK:       ${ask:.4f}")
-        state.log(f"BID:       ${bid_price:.4f}")
+        state.log(f"ASK:       {fmt_px(ask)}")
+        state.log(f"BID:       {fmt_px(bid)}")
+        state.log(f"ALPHA:     {alpha:+.4f} (edge-ask)")
         state.log(f"SHARES:    {shares:.4f}")
         state.log(f"COST:      ${CONFIG['cash_per_trade']:.2f}")
         state.log(f"IF_WIN:    +${potential_profit:.2f}")
         state.log(f"IF_LOSE:   -${potential_loss:.2f}")
-        state.log(f"EV/TRADE:  ${ev_per_trade:+.2f}")
+        state.log(f"EV/TRADE:  {alpha:+.4f} (alpha)")
         state.log(f"TOKEN:     {token_id}")
-        state.log(f"UP:        bid=${s.up.best_bid or 0:.4f} ask=${s.up.best_ask or 0:.4f}")
-        state.log(f"DOWN:      bid=${s.down.best_bid or 0:.4f} ask=${s.down.best_ask or 0:.4f}")
+        state.log(f"UP:        bid={fmt_px(s.up.best_bid)} ask={fmt_px(s.up.best_ask)}")
+        state.log(f"DOWN:      bid={fmt_px(s.down.best_bid)} ask={fmt_px(s.down.best_ask)}")
         state.log(f"TAU:       {s.tau:.1f}s")
         state.log(f"ELAPSED:   {s.elapsed:.1f}s")
-        state.log(f"ZONE_CNT:  {s.zone}={executor.session_trades[s.zone]}/{executor.config.max_trades_per_zone}")
+        state.log(f"SESS_CNT:  {state.session_trade_count}/{CONFIG['max_trades_per_session']}")
         state.log(f"PENDING:   {len(state.pending_paper_trades)} trades awaiting settlement")
         state.log(f"STATS:     W:{state.trades_won} L:{state.trades_lost} PnL:${state.pnl_total:+.2f}")
         state.log(f"{'='*50}")
@@ -1043,11 +1119,9 @@ async def run_dashboard():
                 if runtime_secs > 0 and runtime_secs % 30 == 0 and runtime_secs != getattr(state, '_last_price_log', 0):
                     state._last_price_log = runtime_secs
                     s = state.session
-                    up_bid = s.up.best_bid or 0
-                    up_ask = s.up.best_ask or 0
-                    down_bid = s.down.best_bid or 0
-                    down_ask = s.down.best_ask or 0
-                    state.log(f"[LIVE] Zone:{s.zone} T={int(s.tau)}s | UP:{up_bid:.2f}/{up_ask:.2f} DOWN:{down_bid:.2f}/{down_ask:.2f} | Edge:{s.edge:.3f} {s.edge_direction}")
+                    # Safe price formatting - show NA if None
+                    def px(x): return f"{x:.2f}" if x is not None and x > 0 else "NA"
+                    state.log(f"[LIVE] Zone:{s.zone} T={int(s.tau)}s | UP:{px(s.up.best_bid)}/{px(s.up.best_ask)} DOWN:{px(s.down.best_bid)}/{px(s.down.best_ask)} | Edge:{s.edge:.3f} {s.edge_direction}")
 
                 await asyncio.sleep(0.25)
     except KeyboardInterrupt:
