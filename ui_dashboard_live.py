@@ -806,8 +806,10 @@ async def check_and_execute_signal():
     # ============================================================
     allowed_zones = CONFIG.get("allowed_zones", ["CORE"])
     if s.zone not in allowed_zones:
-        # Only log if we're in a potentially tradeable zone (has edge)
-        if s.edge >= CONFIG["threshold"]:
+        # Only log once per zone change (avoid spam)
+        last_zone_skip = getattr(state, '_last_zone_skip', "")
+        if s.edge >= CONFIG["threshold"] and s.zone != last_zone_skip:
+            state._last_zone_skip = s.zone
             state.log(f"[SKIP] MODE_ZONE_GATE: {s.zone}({window_id}) not in {allowed_zones}")
         return
 
@@ -818,6 +820,8 @@ async def check_and_execute_signal():
             state.log(f"[SESSION] New: {session_id}")
         state.current_session_id = session_id
         state.session_trade_count = 0  # Reset session trade counter
+        state._session_cap_logged = False  # Reset skip log flag
+        state._last_zone_skip = ""  # Reset zone skip tracker
         executor.new_session(session_id)
         state.log(f"[SESSION] Counters reset: session_trades=0")
 
@@ -851,7 +855,10 @@ async def check_and_execute_signal():
     # ============================================================
     max_per_session = CONFIG.get("max_trades_per_session", 1)
     if state.session_trade_count >= max_per_session:
-        state.log(f"[SKIP] SESSION_CAP: {s.zone}({window_id}) {state.session_trade_count}/{max_per_session}")
+        # Only log once per session
+        if not getattr(state, '_session_cap_logged', False):
+            state._session_cap_logged = True
+            state.log(f"[SKIP] SESSION_CAP: {s.zone}({window_id}) {state.session_trade_count}/{max_per_session}")
         return
 
     # ============================================================
