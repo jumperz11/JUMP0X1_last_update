@@ -134,16 +134,37 @@ def fetch_usdc_balance():
 # Zone mode: "T3-only" = CORE only, "T3+T5" = CORE + RECOVERY
 ZONE_MODE = os.getenv("PM_ZONE_MODE", "T3-only")
 
-# Map mode to allowed zones (T3 = minute 3 = CORE zone)
+# Map mode to allowed zones
+# T3 = minute 3 (3:00-3:29) = CORE zone
+# T5 = minute 5 (5:00-5:59) = RECOVERY zone
 ALLOWED_ZONES = {
     "T3-only": ["CORE"],
     "T3+T5": ["CORE", "RECOVERY"],
     "all": ["CORE", "RECOVERY"],
 }
 
+# Zone to Window ID mapping for clear logging
+ZONE_TO_WINDOW = {
+    "EARLY": "T0-T2",   # 0:00-2:59
+    "CORE": "T3",       # 3:00-3:29
+    "DEAD": "T3.5-T4",  # 3:30-4:59
+    "RECOVERY": "T5",   # 5:00-5:59
+    "LATE": "T6+",      # 6:00+
+}
+
+def get_window_id(zone: str, elapsed: float) -> str:
+    """Get window ID like T3 or T5 from zone and elapsed time."""
+    minute = int(elapsed // 60)
+    if zone == "CORE":
+        return "T3"
+    elif zone == "RECOVERY":
+        return "T5"
+    else:
+        return f"T{minute}"
+
 CONFIG = {
     "strategy": "RULEV3+",
-    "version": "1.1",  # Version bump for gate fixes
+    "version": "1.2",  # Version bump for gate improvements
     "mode": ZONE_MODE,
     "allowed_zones": ALLOWED_ZONES.get(ZONE_MODE, ["CORE"]),
     "core_window": "3:00-3:29",
@@ -152,17 +173,23 @@ CONFIG = {
     # EDGE GATE: Minimum mid-price (legacy threshold)
     "threshold": float(os.getenv("PM_EDGE_THRESHOLD", "0.64")),
 
-    # PRICE GATE: Maximum ask price
+    # PRICE GATE: Maximum ask price (hard cap)
     "safety_cap": float(os.getenv("PM_SAFETY_CAP", "0.72")),
 
+    # HARD PRICE CAP: Maximum ask regardless of alpha (prevents tiny payouts)
+    "hard_price_cap": float(os.getenv("PM_HARD_PRICE_CAP", "0.65")),
+
     # ALPHA GATE: Minimum edge over ask (edge - ask >= margin)
-    "alpha_margin": float(os.getenv("PM_ALPHA_MARGIN", "0.02")),
+    # This is the BASE margin - actual margin is max(base, 0.5*spread + fee_buffer)
+    "alpha_margin_base": float(os.getenv("PM_ALPHA_MARGIN", "0.02")),
+    "alpha_spread_mult": float(os.getenv("PM_ALPHA_SPREAD_MULT", "0.5")),  # Multiply spread by this
+    "alpha_fee_buffer": float(os.getenv("PM_ALPHA_FEE_BUFFER", "0.005")),  # Fee buffer (0.5%)
 
     # SESSION GATE: Max trades per session (total, not per zone)
     "max_trades_per_session": int(os.getenv("PM_MAX_TRADES_PER_SESSION", "1")),
 
     # Trade sizing
-    "cash_per_trade": float(os.getenv("PM_CASH_PER_TRADE", "1.00")),
+    "cash_per_trade": float(os.getenv("PM_CASH_PER_TRADE", "5.00")),
     "max_position": float(os.getenv("PM_MAX_POSITION", "8.00")),
 }
 
@@ -753,8 +780,9 @@ async def check_and_execute_signal():
     2. BOOK_GATE: Must have valid bid/ask
     3. SESSION_CAP: Max 1 trade per session (total)
     4. EDGE_GATE: edge >= threshold
-    5. PRICE_GATE: ask < safety_cap
-    6. ALPHA_GATE: edge >= ask + margin (the killer gate)
+    5. HARD_PRICE_GATE: ask <= hard_price_cap (0.65)
+    6. PRICE_GATE: ask < safety_cap (0.72)
+    7. ALPHA_GATE: edge >= ask + margin (spread-aware)
     """
     s = state.session
     executor = state.executor
@@ -770,12 +798,18 @@ async def check_and_execute_signal():
     if executor.kill_switch:
         return
 
+    # Get window ID for logging
+    window_id = get_window_id(s.zone, s.elapsed)
+
     # ============================================================
     # GATE 1: MODE_ZONE_GATE - T3-only means only CORE zone
     # ============================================================
     allowed_zones = CONFIG.get("allowed_zones", ["CORE"])
     if s.zone not in allowed_zones:
-        return  # Silent skip for non-trading zones
+        # Only log if we're in a potentially tradeable zone (has edge)
+        if s.edge >= CONFIG["threshold"]:
+            state.log(f"[SKIP] MODE_ZONE_GATE: {s.zone}({window_id}) not in {allowed_zones}")
+        return
 
     # Check for new session - reset counters
     session_id = s.slug or ""
@@ -802,43 +836,63 @@ async def check_and_execute_signal():
     # GATE 2: BOOK_GATE - Must have valid bid/ask
     # ============================================================
     if bid is None or ask is None or bid <= 0 or ask <= 0:
-        return  # NO_BOOK - silent skip
+        state.log(f"[SKIP] NO_BOOK: {s.zone}({window_id}) bid={bid} ask={ask}")
+        return
 
     if not token_id:
-        state.log(f"[GATE] NO_TOKEN for {direction}")
+        state.log(f"[SKIP] NO_TOKEN: {s.zone}({window_id}) {direction}")
         return
+
+    # Calculate spread for later use
+    spread = ask - bid
 
     # ============================================================
     # GATE 3: SESSION_CAP - Max trades per session (total)
     # ============================================================
     max_per_session = CONFIG.get("max_trades_per_session", 1)
     if state.session_trade_count >= max_per_session:
-        return  # SESSION_CAP - silent skip (already traded this session)
+        state.log(f"[SKIP] SESSION_CAP: {s.zone}({window_id}) {state.session_trade_count}/{max_per_session}")
+        return
 
     # ============================================================
     # GATE 4: EDGE_GATE - edge >= threshold
     # ============================================================
     if s.edge < CONFIG["threshold"]:
-        return  # NO_EDGE - silent skip
+        return  # Silent - edge not reached yet
 
     # ============================================================
-    # GATE 5: PRICE_GATE - ask < safety_cap
+    # GATE 5: HARD_PRICE_GATE - ask <= hard_price_cap (prevents tiny payouts)
     # ============================================================
-    if ask >= CONFIG["safety_cap"]:
-        return  # PRICE_CAP - silent skip
-
-    # ============================================================
-    # GATE 6: ALPHA_GATE - edge >= ask + margin (THE KEY GATE)
-    # ============================================================
-    alpha = s.edge - ask
-    alpha_margin = CONFIG.get("alpha_margin", 0.02)
-    if alpha < alpha_margin:
-        # Log this one since it's the most common filter
-        # state.log(f"[GATE] NO_ALPHA: edge={s.edge:.3f} ask={ask:.3f} alpha={alpha:.3f} < {alpha_margin}")
+    hard_cap = CONFIG.get("hard_price_cap", 0.65)
+    if ask > hard_cap:
+        state.log(f"[SKIP] HARD_PRICE_CAP: {s.zone}({window_id}) ask={ask:.3f} > {hard_cap}")
         return
 
     # ============================================================
-    # GATE 7: EXECUTOR VALIDATION (zone limits, cooldowns)
+    # GATE 6: PRICE_GATE - ask < safety_cap
+    # ============================================================
+    if ask >= CONFIG["safety_cap"]:
+        state.log(f"[SKIP] PRICE_CAP: {s.zone}({window_id}) ask={ask:.3f} >= {CONFIG['safety_cap']}")
+        return
+
+    # ============================================================
+    # GATE 7: ALPHA_GATE - edge >= ask + margin (SPREAD-AWARE)
+    # ============================================================
+    alpha = s.edge - ask
+
+    # Calculate required margin: max(base_margin, 0.5*spread + fee_buffer)
+    base_margin = CONFIG.get("alpha_margin_base", 0.02)
+    spread_mult = CONFIG.get("alpha_spread_mult", 0.5)
+    fee_buffer = CONFIG.get("alpha_fee_buffer", 0.005)
+    spread_margin = spread_mult * spread + fee_buffer
+    required_margin = max(base_margin, spread_margin)
+
+    if alpha < required_margin:
+        state.log(f"[SKIP] NO_ALPHA: {s.zone}({window_id}) edge={s.edge:.3f} ask={ask:.3f} alpha={alpha:.3f} < {required_margin:.3f} (spread={spread:.3f})")
+        return
+
+    # ============================================================
+    # GATE 8: EXECUTOR VALIDATION (zone limits, cooldowns)
     # ============================================================
     valid, reason = executor.validate_signal(s.zone, direction, s.edge, ask)
     if not valid:
@@ -846,12 +900,9 @@ async def check_and_execute_signal():
         return
 
     # ============================================================
-    # ALL GATES PASSED - Calculate EV and execute
+    # ALL GATES PASSED - Execute trade
     # ============================================================
-    # EV = edge - ask (simplified, no fees)
-    ev_alpha = alpha  # This is our true edge
-
-    state.log(f"[SIGNAL] {s.zone} {direction} edge={s.edge:.3f} ask={ask:.2f} alpha={alpha:.3f}")
+    state.log(f"[SIGNAL] {s.zone}({window_id}) {direction} edge={s.edge:.3f} ask={ask:.2f} alpha={alpha:.3f} spread={spread:.3f}")
 
     if is_execution_enabled():
         # REAL EXECUTION - check live trade limit first (0 = unlimited)
@@ -930,7 +981,6 @@ async def check_and_execute_signal():
         state.pending_paper_trades.append(paper_trade)
 
         # Check bid liquidity
-        spread = ask - bid if bid else 0
         fill_status = "FILLED" if spread < 0.05 else "WIDE SPREAD"
 
         # Helper for safe price formatting
@@ -944,13 +994,14 @@ async def check_and_execute_signal():
         state.log(f"{'='*50}")
         state.log(f"TIME:      {trade_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
         state.log(f"SESSION:   {s.slug}")
-        state.log(f"ZONE:      {s.zone}")
+        state.log(f"ZONE:      {s.zone} ({window_id})")
         state.log(f"DIRECTION: {direction}")
         state.log(f"FILL:      {fill_status} (spread: ${spread:.4f})")
         state.log(f"EDGE:      {s.edge:.4f}")
         state.log(f"ASK:       {fmt_px(ask)}")
         state.log(f"BID:       {fmt_px(bid)}")
-        state.log(f"ALPHA:     {alpha:+.4f} (edge-ask)")
+        state.log(f"SPREAD:    ${spread:.4f}")
+        state.log(f"ALPHA:     {alpha:+.4f} (edge-ask, req: {required_margin:.4f})")
         state.log(f"SHARES:    {shares:.4f}")
         state.log(f"COST:      ${CONFIG['cash_per_trade']:.2f}")
         state.log(f"IF_WIN:    +${potential_profit:.2f}")
