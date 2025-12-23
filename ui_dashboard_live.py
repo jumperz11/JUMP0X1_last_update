@@ -176,8 +176,8 @@ CONFIG = {
     # PRICE GATE: Maximum ask price (hard cap)
     "safety_cap": float(os.getenv("PM_SAFETY_CAP", "0.72")),
 
-    # HARD PRICE CAP: Maximum ask regardless of alpha (prevents tiny payouts)
-    "hard_price_cap": float(os.getenv("PM_HARD_PRICE_CAP", "0.65")),
+    # HARD PRICE CAP: Maximum ask regardless of alpha (from backtest: 0.72)
+    "hard_price_cap": float(os.getenv("PM_HARD_PRICE_CAP", "0.72")),
 
     # ALPHA GATE: Minimum edge over ask (edge - ask >= margin)
     # This is the BASE margin - actual margin is max(base, 0.5*spread + fee_buffer)
