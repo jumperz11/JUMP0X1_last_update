@@ -16,13 +16,13 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 from pathlib import Path
 
-# Add current directory to path
-sys.path.insert(0, str(Path(__file__).parent))
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv(Path(__file__).parent.parent / ".env")
 
-from trade_executor import TradeExecutor, ExecutorConfig, OrderStatus, OrderResult
+from src.core.trade_executor import TradeExecutor, ExecutorConfig, OrderStatus, OrderResult
 
 
 # ============================================================
@@ -178,7 +178,7 @@ def test_B_paper_mode(report: VerificationReport):
     )
 
     # B2: Check is_real_mode() function
-    from ui_dashboard_live import is_real_mode
+    from src.ui.ui_dashboard_live import is_real_mode
     report.add(
         "B2: is_real_mode() returns False",
         not is_real_mode(),
@@ -198,7 +198,7 @@ def test_B_paper_mode(report: VerificationReport):
     # B4: Paper mode updates executor state (prevents double-fire)
     # Verify the code has: executor.session_trades[s.zone] = ...
     import inspect
-    from ui_dashboard_live import check_and_execute_signal
+    from src.ui.ui_dashboard_live import check_and_execute_signal
     source = inspect.getsource(check_and_execute_signal)
 
     has_zone_update = "executor.session_trades[s.zone]" in source
@@ -314,7 +314,7 @@ def test_D_slippage_logic(report: VerificationReport):
     valid2, reason2 = executor.validate_signal("CORE", "Down", 0.65, 0.65)
     report.add(
         "D3b: Trading blocked when kill_switch=True",
-        not valid2 and "Kill switch" in reason2,
+        not valid2 and "KILL SWITCH" in reason2,
         f"valid={valid2}, reason={reason2}"
     )
 
@@ -427,7 +427,7 @@ def test_F_pnl_balance(report: VerificationReport):
     )
 
     # F3: Paper mode should NOT deduct balance
-    from ui_dashboard_live import is_real_mode
+    from src.ui.ui_dashboard_live import is_real_mode
     report.add(
         "F3: Paper mode does not touch real balance",
         not is_real_mode(),
@@ -501,7 +501,7 @@ def test_G_logging_consistency(report: VerificationReport):
     )
 
     # G4: UI state updated from same source
-    from ui_dashboard_live import DashboardState, on_order_update, state
+    from src.ui.ui_dashboard_live import DashboardState, on_order_update, state
     report.add(
         "G4: UI on_order_update updates state.last_order",
         True,  # Code inspection of ui_dashboard_live.py:502-515
@@ -524,7 +524,7 @@ def test_H_execution_gate(report: VerificationReport):
     print("[H] EXECUTION GATE + LIVE TRADE LIMITER")
     print("-" * 40)
 
-    from ui_dashboard_live import (
+    from src.ui.ui_dashboard_live import (
         is_real_mode, is_execution_enabled, CREDENTIALS, state
     )
 
@@ -553,7 +553,7 @@ def test_H_execution_gate(report: VerificationReport):
 
     # H4: Paper mode = EXEC:OFF not shown (code check)
     import inspect
-    from ui_dashboard_live import make_header
+    from src.ui.ui_dashboard_live import make_header
     source = inspect.getsource(make_header)
 
     has_exec_indicator = "EXEC:ON" in source and "EXEC:OFF" in source
@@ -565,7 +565,7 @@ def test_H_execution_gate(report: VerificationReport):
 
     # H5: Live trade limit blocks after max reached
     import inspect
-    from ui_dashboard_live import check_and_execute_signal
+    from src.ui.ui_dashboard_live import check_and_execute_signal
     source = inspect.getsource(check_and_execute_signal)
 
     has_limit_check = "live_trades_this_run >= state.max_live_trades_per_run" in source
@@ -626,7 +626,7 @@ def test_I_kill_switch_simulation(report: VerificationReport):
     can_trade, reason = executor.can_trade("CORE")
     report.add(
         "I4: Kill switch blocks can_trade()",
-        not can_trade and "Kill switch" in reason,
+        not can_trade and "KILL SWITCH" in reason,
         f"can_trade={can_trade}, reason={reason}"
     )
 
@@ -634,7 +634,7 @@ def test_I_kill_switch_simulation(report: VerificationReport):
     valid, reason = executor.validate_signal("CORE", "Down", 0.65, 0.65)
     report.add(
         "I5: Kill switch blocks validate_signal()",
-        not valid and "Kill switch" in reason,
+        not valid and "KILL SWITCH" in reason,
         f"valid={valid}, reason={reason}"
     )
 

@@ -1,248 +1,141 @@
 # JUMP01X Commands Reference
 
-Quick reference for all runner scripts and commands.
+**Updated:** 2024-12-24
+**System:** Python (RULEV3+ Phase 1)
 
 ---
 
-## Runner Scripts (All Terminals)
+## Current Commands (Python)
 
-All scripts are in `PK8_PH/scripts/`. Run from `PK8_PH/` directory.
+### Run Live Dashboard
 
-### Run Everything
-
-**Git Bash / Mac / Linux:**
-```bash
-./scripts/run_all.sh
-```
-
-**PowerShell:**
 ```powershell
-bash scripts/run_all.sh
+cd "C:\Users\Mega-PC\Desktop\New folder (3)\JUMP0X1-main (1)\JUMP0X1-main"
+python ui_dashboard_live.py
 ```
 
-- Starts both A/B test and collector
-- Creates timestamped directories
-- Uses tmux split if available, otherwise background mode
+**Controls:**
+- `q` - Quit
+- Dashboard auto-refreshes
 
-### Run A/B Test Only
+### Run Backtest (Phase 1)
 
-**Git Bash / Mac / Linux:**
-```bash
-./scripts/run_ab.sh
-```
-
-**PowerShell:**
 ```powershell
-cd C:\Users\Mega-PC\Desktop\JUMP0X1\PK8_PH
-$env:PATH = "C:\msys64\mingw64\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
-$env:LOG_DIR = "logs\runs\$(Get-Date -Format 'yyyyMMdd_HHmm')_AB"
-$env:AB_TEST = "1"
-$env:ENABLE_ORDERS_JSONL = "1"
-$env:MAX_TRADES_PER_SESSION = "1"
-New-Item -ItemType Directory -Force -Path $env:LOG_DIR
-.\target\release\live_console.exe
+cd "C:\Users\Mega-PC\Desktop\New folder (3)\JUMP0X1-main (1)\JUMP0X1-main"
+python backtest_alpha_test.py
 ```
 
-**CMD:**
-```cmd
-cd C:\Users\Mega-PC\Desktop\JUMP0X1\PK8_PH
-set PATH=C:\msys64\mingw64\bin;%USERPROFILE%\.cargo\bin;%PATH%
-set LOG_DIR=logs\runs\%date:~-4%%date:~4,2%%date:~7,2%_AB
-set AB_TEST=1
-set ENABLE_ORDERS_JSONL=1
-set MAX_TRADES_PER_SESSION=1
-mkdir %LOG_DIR% 2>nul
-target\release\live_console.exe
-```
+**Expected output:**
+- Trades: 1064
+- Win rate: 72.09%
+- AvgPnL/trade: $0.3276
+- Total PnL: $348.58
 
-- Runs `live_console` with paper_baseline vs rule_v1
-- Creates `YYYYMMDD_HHMM_AB` directory
-- Updates `LATEST_AB` symlink
+### Run Pre-Live Verification
 
-### Run Collector Only
-
-**Git Bash / Mac / Linux:**
-```bash
-./scripts/run_collector.sh
-```
-
-**PowerShell:**
 ```powershell
-cd C:\Users\Mega-PC\Desktop\JUMP0X1\PK8_PH
-$env:PATH = "C:\msys64\mingw64\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
-$env:LOG_DIR = "logs\runs\$(Get-Date -Format 'yyyyMMdd_HHmm')_COLLECT"
-New-Item -ItemType Directory -Force -Path $env:LOG_DIR
-.\target\release\multi_signal_recorder.exe
-```
-
-**CMD:**
-```cmd
-cd C:\Users\Mega-PC\Desktop\JUMP0X1\PK8_PH
-set PATH=C:\msys64\mingw64\bin;%USERPROFILE%\.cargo\bin;%PATH%
-set LOG_DIR=logs\runs\collect_run
-mkdir %LOG_DIR% 2>nul
-target\release\multi_signal_recorder.exe
-```
-
-- Runs `multi_signal_recorder` for price/signal data
-- Creates `YYYYMMDD_HHMM_COLLECT` directory
-- Updates `LATEST_COLLECT` symlink
-
-### Check Status
-
-**Git Bash / Mac / Linux:**
-```bash
-./scripts/check_status.sh
-```
-
-**PowerShell:**
-```powershell
-Get-Content logs\runs\LATEST_AB\orders_*.jsonl | Select-String '"action":"FILL"' | Measure-Object
-```
-
-**CMD:**
-```cmd
-findstr /c:"\"action\":\"FILL\"" logs\runs\LATEST_AB\orders_*.jsonl | find /c /v ""
-```
-
-- Shows fill counts for both strategies
-- Shows rule_v1 W/L and P&L
-
----
-
-## Manual Commands
-
-### Quick Fill Count
-
-**Git Bash / Mac / Linux:**
-```bash
-grep -c '"action":"FILL"' logs/runs/LATEST_AB/orders_*.jsonl
-```
-
-**PowerShell:**
-```powershell
-(Get-Content logs\runs\LATEST_AB\orders_*.jsonl | Select-String '"action":"FILL"').Count
-```
-
-**CMD:**
-```cmd
-findstr /c:"\"action\":\"FILL\"" logs\runs\LATEST_AB\orders_*.jsonl | find /c /v ""
-```
-
-### rule_v1 Performance
-
-**Git Bash / Mac / Linux:**
-```bash
-cat logs/runs/LATEST_AB/orders_rule_v1.jsonl | jq -s '
-  [.[] | select(.action == "FILL")] |
-  {
-    wins: [.[] | select(.outcome == "up")] | length,
-    losses: [.[] | select(.outcome == "down")] | length,
-    pnl: [.[] | if .outcome == "up" then (1 - .avg_fill_q) else (0 - .avg_fill_q) end] | add
-  }'
-```
-
-**PowerShell (requires jq):**
-```powershell
-Get-Content logs\runs\LATEST_AB\orders_rule_v1.jsonl | jq -s '[.[] | select(.action == \"FILL\")] | {wins: [.[] | select(.outcome == \"up\")] | length, losses: [.[] | select(.outcome == \"down\")] | length}'
-```
-
-### Price Bucket Analysis (rule_v1 only)
-
-**Git Bash / Mac / Linux:**
-```bash
-cat logs/runs/LATEST_AB/orders_rule_v1.jsonl | jq -s '
-  [.[] | select(.action == "FILL")] | group_by(
-    if .avg_fill_q < 0.54 then "0.50-0.54"
-    elif .avg_fill_q < 0.58 then "0.54-0.58"
-    elif .avg_fill_q < 0.64 then "0.58-0.64"
-    else "0.64+"
-    end
-  ) | map({
-    bucket: .[0] | (if .avg_fill_q < 0.54 then "0.50-0.54" elif .avg_fill_q < 0.58 then "0.54-0.58" elif .avg_fill_q < 0.64 then "0.58-0.64" else "0.64+" end),
-    n: length,
-    wins: [.[] | select(.outcome == "up")] | length,
-    pnl: [.[] | if .outcome == "up" then (1 - .avg_fill_q) else (0 - .avg_fill_q) end] | add
-  }) | sort_by(.bucket)'
+cd "C:\Users\Mega-PC\Desktop\New folder (3)\JUMP0X1-main (1)\JUMP0X1-main"
+python verify_pre_live.py
 ```
 
 ---
 
-## Environment Variables
+## Configuration
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LOG_DIR` | required | Output directory for logs |
-| `AB_TEST` | 0 | Enable dual-strategy (1=on) |
-| `ENABLE_ORDERS_JSONL` | 0 | Log order events (1=on) |
-| `MAX_TRADES_PER_SESSION` | unlimited | Trades per 15m session |
+### .env Settings (Phase 1)
 
-### Example Manual Run
-
-**Git Bash / Mac / Linux:**
 ```bash
-LOG_DIR=./logs/runs/MY_TEST AB_TEST=1 ENABLE_ORDERS_JSONL=1 MAX_TRADES_PER_SESSION=1 ./target/release/live_console
+# Mode
+TRADING_MODE=paper          # paper or real
+EXECUTION_ENABLED=false     # true to execute real orders
+
+# Strategy
+PM_EDGE_THRESHOLD=0.64      # Min edge to trade
+PM_SAFETY_CAP=0.72          # Max price to pay
+PM_CASH_PER_TRADE=5.00      # $ per trade
+
+# Limits
+MAX_LIVE_TRADES_PER_RUN=1   # Training wheel
 ```
 
-**PowerShell:**
+---
+
+## Log Files
+
+| Location | Content |
+|----------|---------|
+| `logs/paper/trades_YYYYMMDD_HHMMSS.log` | Paper trade logs |
+| `logs/real/trades_YYYYMMDD_HHMMSS.log` | Real trade logs |
+
+### View Latest Log
+
 ```powershell
-$env:LOG_DIR="logs\runs\MY_TEST"; $env:AB_TEST="1"; $env:ENABLE_ORDERS_JSONL="1"; $env:MAX_TRADES_PER_SESSION="1"; mkdir $env:LOG_DIR -Force; .\target\release\live_console.exe
+Get-Content "logs\paper\trades_*.log" -Tail 50
 ```
 
-**CMD:**
-```cmd
-set LOG_DIR=logs\runs\MY_TEST && set AB_TEST=1 && set ENABLE_ORDERS_JSONL=1 && set MAX_TRADES_PER_SESSION=1 && mkdir %LOG_DIR% 2>nul && target\release\live_console.exe
+### Search for Trades
+
+```powershell
+Select-String -Path "logs\paper\*.log" -Pattern "ENTRY|SETTLED"
+```
+
+### Count Trades
+
+```powershell
+(Select-String -Path "logs\paper\*.log" -Pattern "\[ENTRY\]").Count
 ```
 
 ---
 
-## Output Files
+## Dashboard Stats Format
 
-| File | Contents |
-|------|----------|
-| `orders_paper_baseline.jsonl` | Baseline strategy events |
-| `orders_rule_v1.jsonl` | rule_v1 strategy events |
-| `multi_signal_sessions_btc.jsonl` | Collector snapshots |
+```
+[STATS] 5m | Sessions: 6 (skip:4) | Trades: 2 (pend:1) | W/L: 1/0 (100%) | AvgPnL: $+2.69 | PnL: $+2.69
+```
 
----
-
-## Symlinks
-
-| Symlink | Points To |
-|---------|-----------|
-| `logs/runs/LATEST_AB` | Most recent A/B test run |
-| `logs/runs/LATEST_COLLECT` | Most recent collector run |
+| Field | Meaning |
+|-------|---------|
+| `Sessions: 6 (skip:4)` | 6 seen, 4 skipped |
+| `Trades: 2 (pend:1)` | 2 total, 1 pending settlement |
+| `W/L: 1/0 (100%)` | Wins/Losses (win rate) |
+| `AvgPnL: $+2.69` | Average PnL per settled trade |
+| `PnL: $+2.69` | Total cumulative PnL |
 
 ---
 
-## Build
+## Go-Live Commands (After 50 Paper Trades)
 
-**All Terminals (with cargo in PATH):**
+```powershell
+# 1. Update .env
+TRADING_MODE=real
+EXECUTION_ENABLED=true
+MAX_LIVE_TRADES_PER_RUN=1
+
+# 2. Run dashboard
+python ui_dashboard_live.py
+
+# 3. Monitor first trades carefully
+```
+
+---
+
+## Legacy Commands (Rust - Archived)
+
+> **Note:** The Rust framework (PK8_PH) is archived. See below for historical reference.
+
+### Old Rust Commands
 
 ```bash
-cargo build --release --bin live_console
-cargo build --release --bin multi_signal_recorder
-```
-
-Or build all:
-```bash
+# Build (legacy)
 cargo build --release
-```
 
-**Windows - ensure PATH includes:**
-```
-C:\msys64\mingw64\bin
-%USERPROFILE%\.cargo\bin
+# Run live console (legacy)
+cargo run --bin live_console
+
+# Run backtest (legacy)
+cargo run --bin backtest -- --base ../markets_paper
 ```
 
 ---
 
-## Terminal Quick Reference
-
-| Terminal | Best For | Notes |
-|----------|----------|-------|
-| **Git Bash** | Running .sh scripts directly | Comes with Git for Windows |
-| **PowerShell** | Native Windows, scripting | Use `$env:VAR` for env vars |
-| **CMD** | Simple commands | Use `set VAR=value` for env vars |
-| **Windows Terminal** | All of the above | Select profile for shell type |
-| **MSYS2** | Full Linux-like environment | Best compatibility with bash scripts |
+**Config Signature:** `PHASE1-SPREAD-0.02-EDGE-0.64-CAP-0.72-CORE-ONLY`

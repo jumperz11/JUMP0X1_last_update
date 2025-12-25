@@ -1,68 +1,74 @@
 # RULEV3+ Strategy
 
+**Version:** Phase 1 (LOCKED)
+**Updated:** 2024-12-24
+
 Directional trading strategy for Polymarket BTC 15-minute Up/Down markets.
+
+---
 
 ## Core Concept
 
-Instead of arbitrage (buying both sides), RULEV3+ makes directional bets based on:
-- **Edge** - The mid price of the stronger side (proxy for market conviction)
-- **Timing** - Specific windows where signals are most reliable
-- **Position limits** - One trade per zone per session
+RULEV3+ makes directional bets based on:
+- **Edge** - The mid price of the stronger side (market conviction proxy)
+- **Timing** - CORE window (3:00-3:29) for reliable signals
+- **Position limits** - One trade per session
 
-## Trading Windows
+---
+
+## Phase 1 Configuration (LOCKED)
+
+```
+ZONE_MODE          = CORE-only (T3 = 3:00-3:29)
+EDGE_THRESHOLD     = 0.64
+SAFETY_CAP         = 0.72
+SPREAD_MAX         = 0.02
+ALPHA_GATE         = REMOVED
+MAX_TRADES_SESSION = 1
+POSITION_SIZE      = $5.00
+```
+
+---
+
+## Trading Window (Phase 1)
 
 ```
 Session Timeline (15 minutes):
-0:00 ──────────────────────────────────────────── 15:00
-     │         │     │         │     │
-     0min      3min  3:29      5min  5:59    6min+
-     │         │─────│         │─────│       │
-     WAIT      CORE            RECOVERY      LATE (no trade)
+0:00 ─────────────────────────────────────────────── 15:00
+     │           │────│                              │
+     0min        3:00 3:29                          15min
+     │           │────│                              │
+     WAIT        CORE (trade here)                   END
 ```
 
 | Zone | Elapsed Time | Action |
 |------|--------------|--------|
-| WAIT | 0:00 - 2:59 | No trade - too early |
-| **CORE** | 3:00 - 3:29 | Primary entry window |
-| WAIT | 3:30 - 4:59 | No trade - between windows |
-| **RECOVERY** | 5:00 - 5:59 | Secondary entry window |
-| LATE | 6:00+ | No trade - too late |
+| EARLY | 0:00 - 2:59 | No trade - too early |
+| **CORE** | 3:00 - 3:29 | Entry window (Phase 1) |
+| DEAD | 3:30 - 4:59 | No trade |
+| LATE | 5:00+ | No trade |
 
-## Entry Conditions
+**Note:** RECOVERY zone (5:00-5:59) disabled in Phase 1.
 
-All conditions must be TRUE to enter:
+---
 
-### 1. Time Window
-```python
-if zone not in ["CORE", "RECOVERY"]:
-    return NO_TRADE
+## Gate Order (Phase 1)
+
+All gates must pass to enter:
+
+```
+1. MODE_ZONE_GATE    → zone == CORE
+2. BOOK_GATE         → valid bid/ask exists
+3. SESSION_CAP       → trades_this_session < 1
+4. EDGE_GATE         → edge >= 0.64
+5. HARD_PRICE_GATE   → ask <= 0.72
+6. PRICE_GATE        → ask < 0.72
+7. BAD_BOOK          → spread >= 0 AND bid <= ask
+8. SPREAD_GATE       → spread <= 0.02
+9. EXECUTOR_VALID    → zone limits, cooldowns
 ```
 
-### 2. Edge Threshold (>= 0.64)
-```python
-edge = max(up_mid, down_mid)  # Mid price of stronger side
-if edge < 0.64:
-    return NO_TRADE
-```
-
-### 3. Safety Cap (< 0.72)
-```python
-ask = up_ask if direction == "Up" else down_ask
-if ask >= 0.72:
-    return NO_TRADE  # Too expensive
-```
-
-### 4. Zone Limit (max 1 per zone)
-```python
-if zone_trades[zone] >= 1:
-    return NO_TRADE
-```
-
-### 5. Cooldown (5 seconds)
-```python
-if time_since_last_trade < 5:
-    return NO_TRADE
-```
+---
 
 ## Direction Selection
 
@@ -70,7 +76,7 @@ if time_since_last_trade < 5:
 up_mid = (up_bid + up_ask) / 2
 down_mid = (down_bid + down_ask) / 2
 
-if up_mid > down_mid:
+if up_mid >= down_mid:
     direction = "Up"
     edge = up_mid
 else:
@@ -78,7 +84,9 @@ else:
     edge = down_mid
 ```
 
-The direction with higher mid price shows stronger market conviction.
+The side with higher mid price shows stronger market conviction.
+
+---
 
 ## Position Sizing
 
@@ -89,31 +97,48 @@ shares = cash_per_trade / ask_price
 # $5.00 / $0.65 = 7.69 shares
 ```
 
-## Expected Value
+---
+
+## Payout Structure
 
 ```python
-# If we buy at ask price:
 if_win = shares * 1.00 - cost   # Shares pay $1 each
 if_lose = -cost                  # Lose entire stake
-
-# EV calculation:
-# edge represents implied win probability
-ev = edge * if_win - (1 - edge) * if_lose
 ```
 
 | Entry @ | Shares ($5) | If Win | If Lose | Break-even WR |
 |---------|-------------|--------|---------|---------------|
 | $0.65 | 7.69 | +$2.69 | -$5.00 | 65% |
-| $0.60 | 8.33 | +$3.33 | -$5.00 | 60% |
-| $0.55 | 9.09 | +$4.09 | -$5.00 | 55% |
+| $0.68 | 7.35 | +$2.35 | -$5.00 | 68% |
+| $0.70 | 7.14 | +$2.14 | -$5.00 | 70% |
+
+---
+
+## Backtest Results (Phase 1)
+
+| Metric | Value |
+|--------|-------|
+| Total sessions | 2,085 |
+| Total trades | 1,064 |
+| Trades per session | 0.51 |
+| **Win rate** | **72.09%** |
+| **AvgPnL/trade** | **$0.3276** |
+| **Total PnL** | **$348.58** |
+| Max drawdown | $65.35 |
+| Avg ask at entry | 0.6768 |
+| Avg spread at entry | 0.0104 |
+
+---
 
 ## Settlement
 
 Polymarket auto-settles at session end:
-- If BTC went up: UP shares pay $1.00 each, DOWN pays $0
-- If BTC went down: DOWN shares pay $1.00 each, UP pays $0
+- If BTC went up: UP shares pay $1.00, DOWN pays $0
+- If BTC went down: DOWN shares pay $1.00, UP pays $0
 
-**No need to sell** - just hold until settlement.
+**No need to sell** - hold until settlement.
+
+---
 
 ## Safety Features
 
@@ -123,9 +148,16 @@ TRADING_MODE=real AND EXECUTION_ENABLED=true
 ```
 Both must be true for real orders.
 
-### Trade Limiter
+### Session Trade Cap
 ```python
-MAX_LIVE_TRADES_PER_RUN = 1  # or 0 for unlimited
+if session_trade_count >= 1:
+    SKIP  # Max 1 trade per session
+```
+
+### Spread Gate
+```python
+if spread > 0.02:
+    SKIP  # Spread too wide
 ```
 
 ### Kill Switch
@@ -134,73 +166,59 @@ if degraded_fills >= 2:
     kill_switch = True  # Stop all trading
 ```
 
-### Zone Limits
-```python
-max_trades_per_zone = 1
-# Only 1 CORE and 1 RECOVERY trade per session
+---
+
+## Why Alpha Gate Was Removed (Phase 1)
+
+The alpha formula was structurally broken:
+
+```
+edge = mid = (bid + ask) / 2
+alpha = edge - ask = mid - ask = -spread/2
+
+Result: alpha is ALWAYS negative
+Gate: alpha >= 0.02 can NEVER pass
 ```
 
-## Backtest Results
+**Fix:** Removed alpha gate, added spread hygiene gate instead.
 
-Based on 100+ sessions:
+**Phase 2:** Build p_model from historical calibration, then reintroduce alpha = p_model - ask.
 
-| Metric | Value |
-|--------|-------|
-| Win Rate | ~63% |
-| Avg Entry | $0.575 |
-| Sweet Spot (< $0.58) | 80% WR |
-| EV/Trade | +$0.024 |
-
-### Entry Price Analysis
-
-| Price Bucket | Win Rate | EV/Trade |
-|--------------|----------|----------|
-| < $0.58 | **80%** | **+$0.26** |
-| $0.58 - $0.64 | 54% | -$0.07 |
-| > $0.64 | 50% | -$0.27 |
-
-## Configuration
-
-```bash
-# .env settings
-PM_EDGE_THRESHOLD=0.64    # Min edge to trade
-PM_SAFETY_CAP=0.72        # Max price to pay
-PM_CASH_PER_TRADE=5.00    # $ per trade
-PM_MAX_POSITION=8.00      # Max total position
-```
-
-## Key Insights
-
-1. **Edge = Classification, not Speed**
-   - We're not racing on milliseconds
-   - We're classifying which side has conviction
-
-2. **Timing Windows Matter**
-   - CORE (3:00-3:29): Primary signal
-   - RECOVERY (5:00-5:59): Second chance
-   - LATE (6:00+): Signal already priced in
-
-3. **Entry Price is Critical**
-   - Below $0.58: Strong +EV
-   - Above $0.64: Likely -EV
-   - Safety cap at $0.72 prevents overpaying
-
-4. **One Trade Per Zone**
-   - Prevents overtrading
-   - Forces selectivity
-   - Limits exposure per session
+---
 
 ## What NOT to Do
 
 | Bad Practice | Why |
 |--------------|-----|
-| Trade in LATE zone | Signal already priced in |
-| Chase high prices (>$0.72) | Negative EV |
-| Multiple trades per zone | Overexposure |
-| Ignore edge threshold | Random entries |
-| Trade both directions | Defeats directional edge |
+| Trade outside CORE zone | Not validated in Phase 1 |
+| Pay > $0.72 | Negative expected value |
+| Multiple trades per session | Overexposure |
+| Ignore spread gate | Wide spreads = bad fills |
+| Trade when spread > 0.02 | Illiquid conditions |
 
 ---
 
-**Strategy Version:** RULEV3+ v1.0
-**Last Updated:** December 2025
+## Key Insights
+
+1. **Edge = Classification, not Speed**
+   - We classify which side has conviction
+   - Not racing on milliseconds
+
+2. **CORE Window is Primary**
+   - 3:00-3:29 (30 seconds)
+   - Signal most reliable here
+
+3. **Entry Price is Critical**
+   - Average entry: $0.6768
+   - Safety cap: $0.72
+   - Never overpay
+
+4. **One Trade Per Session**
+   - Forces selectivity
+   - Limits exposure
+   - Matches backtest
+
+---
+
+**Strategy Version:** RULEV3+ Phase 1
+**Config Signature:** `PHASE1-SPREAD-0.02-EDGE-0.64-CAP-0.72-CORE-ONLY`

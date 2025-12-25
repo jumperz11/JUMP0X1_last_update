@@ -1,4 +1,10 @@
 # JUMP01X Visual Quant Report
+
+**Status:** ARCHIVE (Historical Research)
+**Note:** Early research that informed RULEV3+ development. See PHASE1_LOCKED.md for current config.
+
+---
+
 ## BTC 15-min Sessions | n=23 | 18:15:00 - 23:45:00
 
 ---

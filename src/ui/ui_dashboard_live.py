@@ -28,19 +28,29 @@ except ImportError:
 
 try:
     from dotenv import load_dotenv
-    # Load .env from same directory
-    env_path = Path(__file__).parent / ".env"
+    # Load .env from project root
+    env_path = Path(__file__).parent.parent.parent / ".env"
     load_dotenv(env_path)
 except ImportError:
     pass  # dotenv not required
 
-from polymarket_connector import (
+# Add project root to path for imports
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from src.core.polymarket_connector import (
     SessionManager, SessionState, GammaClient,
     derive_current_slug, format_elapsed, get_zone,
     SESSION_DURATION
 )
 
-from trade_executor import TradeExecutor, ExecutorConfig, OrderStatus, OrderResult
+from src.core.trade_executor import TradeExecutor, ExecutorConfig, OrderStatus, OrderResult
+
+# Real trade logging (only writes when enabled=True in real mode)
+from src.core.real_trade_logger import (
+    init_real_logger, get_real_logger,
+    real_log_start, real_log_stop, real_log_signal, real_log_settled
+)
 
 
 # ============================================================
@@ -140,7 +150,6 @@ ZONE_MODE = os.getenv("PM_ZONE_MODE", "T3-only")
 ALLOWED_ZONES = {
     "T3-only": ["CORE"],
     "T3+T5": ["CORE", "RECOVERY"],
-    "all": ["CORE", "RECOVERY"],
 }
 
 # Zone to Window ID mapping for clear logging
@@ -240,9 +249,17 @@ class DashboardState:
     # Session trade counter (reset on session change)
     session_trade_count: int = 0  # Total trades this session (not per zone)
 
+    # Clean shutdown flag (for max_trades_cap auto-stop)
+    should_stop: bool = False
+    stop_reason: str = ""
+
     # Paper trade tracking for win/loss settlement
     pending_paper_trades: List[PaperTrade] = field(default_factory=list)
     settled_paper_trades: List[PaperTrade] = field(default_factory=list)
+
+    # Real trade tracking for win/loss settlement
+    pending_real_trades: List[PaperTrade] = field(default_factory=list)
+    settled_real_trades: List[PaperTrade] = field(default_factory=list)
 
     # Periodic logging tracker
     _last_stats_log: int = 0
@@ -327,8 +344,27 @@ def settle_paper_trades(old_session_id: str, final_up_price: float, final_down_p
         result_emoji = "WIN" if trade.won else "LOSS"
         pnl_str = f"+${trade.pnl:.2f}" if trade.pnl >= 0 else f"-${abs(trade.pnl):.2f}"
 
+        # Construct paper order ID (matches the format from check_and_execute_signal)
+        paper_order_id = f"PAPER-{trade.timestamp.strftime('%Y%m%d%H%M%S')}-{trade.trade_id:04d}"
+
         state.log(f"TRADE #{trade.trade_id}: {trade.direction} @ ${trade.entry_price:.2f}")
         state.log(f"  RESULT: {result_emoji} | PnL: {pnl_str}")
+        state.log(f"[SETTLED] {paper_order_id} {result_emoji} pnl={pnl_str}")
+
+        # Update executor killswitch tracking (with trade_id to prevent double-count)
+        if state.executor:
+            trade_key = f"{trade.session_id}_{trade.trade_id}"
+            state.executor.record_result(won=trade.won, pnl=trade.pnl, trade_id=trade_key)
+
+            # Log settlement to real trade log (only if real mode enabled)
+            real_log_settled(
+                order_id=trade_key,
+                market_id=trade.session_id,
+                won=trade.won,
+                trade_pnl=trade.pnl,
+                cumulative_pnl=state.executor.cumulative_pnl,
+                consecutive_losses=state.executor.consecutive_losses
+            )
 
     # Remove settled trades from pending
     state.pending_paper_trades = [t for t in state.pending_paper_trades if t.session_id != old_session_id]
@@ -337,6 +373,81 @@ def settle_paper_trades(old_session_id: str, final_up_price: float, final_down_p
     wr = 100 * state.trades_won / (state.trades_won + state.trades_lost) if (state.trades_won + state.trades_lost) > 0 else 0
     state.log("")
     state.log(f"SESSION STATS:")
+    state.log(f"  Trades settled: {len(session_trades)}")
+    state.log(f"  Total W/L:      {state.trades_won}/{state.trades_lost}")
+    state.log(f"  Win Rate:       {wr:.1f}%")
+    state.log(f"  Running PnL:    ${state.pnl_total:+.2f}")
+
+
+def settle_real_trades(old_session_id: str, final_up_price: float, final_down_price: float):
+    """Settle real trades when session ends. Determine win/loss based on final prices."""
+    if not state.pending_real_trades:
+        return
+
+    # Get trades for this session
+    session_trades = [t for t in state.pending_real_trades if t.session_id == old_session_id and not t.settled]
+
+    if not session_trades:
+        return
+
+    # Determine winner: the side closer to 1.0 wins
+    up_won = final_up_price > final_down_price
+
+    state.log("")
+    state.log(f"{'='*50}")
+    state.log(f"[REAL] SESSION SETTLEMENT: {old_session_id}")
+    state.log(f"{'='*50}")
+    state.log(f"FINAL UP:   ${final_up_price:.4f}")
+    state.log(f"FINAL DOWN: ${final_down_price:.4f}")
+    state.log(f"WINNER:     {'UP' if up_won else 'DOWN'}")
+    state.log("")
+
+    for trade in session_trades:
+        trade.settled = True
+
+        # Check if trade direction matches winner
+        if (trade.direction == "Up" and up_won) or (trade.direction == "Down" and not up_won):
+            # WIN: we get $1 per share, minus cost
+            trade.won = True
+            trade.pnl = trade.shares - trade.cost  # $1 * shares - cost
+            state.trades_won += 1
+        else:
+            # LOSE: we get $0, lose entire cost
+            trade.won = False
+            trade.pnl = -trade.cost
+            state.trades_lost += 1
+
+        state.pnl_total += trade.pnl
+        state.settled_real_trades.append(trade)
+
+        result_emoji = "✅ WIN" if trade.won else "❌ LOSS"
+        pnl_str = f"+${trade.pnl:.2f}" if trade.pnl >= 0 else f"-${abs(trade.pnl):.2f}"
+
+        state.log(f"[REAL] TRADE #{trade.trade_id}: {trade.direction} @ ${trade.entry_price:.2f}")
+        state.log(f"  RESULT: {result_emoji} | PnL: {pnl_str}")
+
+        # Update executor killswitch tracking
+        if state.executor:
+            trade_key = f"REAL_{trade.session_id}_{trade.trade_id}"
+            state.executor.record_result(won=trade.won, pnl=trade.pnl, trade_id=trade_key)
+
+            # Log settlement to real trade log
+            real_log_settled(
+                order_id=trade_key,
+                market_id=trade.session_id,
+                won=trade.won,
+                trade_pnl=trade.pnl,
+                cumulative_pnl=state.executor.cumulative_pnl,
+                consecutive_losses=state.executor.consecutive_losses
+            )
+
+    # Remove settled trades from pending
+    state.pending_real_trades = [t for t in state.pending_real_trades if t.session_id != old_session_id]
+
+    # Summary
+    wr = 100 * state.trades_won / (state.trades_won + state.trades_lost) if (state.trades_won + state.trades_lost) > 0 else 0
+    state.log("")
+    state.log(f"[REAL] SESSION STATS:")
     state.log(f"  Trades settled: {len(session_trades)}")
     state.log(f"  Total W/L:      {state.trades_won}/{state.trades_lost}")
     state.log(f"  Win Rate:       {wr:.1f}%")
@@ -419,7 +530,11 @@ def make_header():
 
     pnl_color = "green" if state.pnl_total >= 0 else "red"
     settled = state.trades_won + state.trades_lost
-    pending = len(state.pending_paper_trades)
+    # Count pending trades based on mode
+    if is_real_mode():
+        pending = len(state.pending_real_trades)
+    else:
+        pending = len(state.pending_paper_trades)
     wr = int(100 * state.trades_won / settled) if settled > 0 else 0
 
     # Wallet short address
@@ -593,7 +708,11 @@ def make_session_info():
 
 def make_performance():
     settled = state.trades_won + state.trades_lost
-    pending = len(state.pending_paper_trades)
+    # Count pending trades based on mode
+    if is_real_mode():
+        pending = len(state.pending_real_trades)
+    else:
+        pending = len(state.pending_paper_trades)
     total = state.trades_total
     wr = 100 * state.trades_won / settled if settled else 0
     ev = state.pnl_total / settled if settled else 0
@@ -764,6 +883,25 @@ def on_order_update(result: OrderResult):
         if state.executor:
             state.usdc_balance = state.executor.balance
 
+        # Track real trades for settlement
+        if is_real_mode():
+            cost = result.fill_price * result.filled_size
+            potential_win = (1.0 - result.fill_price) * result.filled_size
+            real_trade = PaperTrade(
+                trade_id=state.trades_total,
+                session_id=state.session.session_id if state.session else "",
+                direction=result.direction,
+                entry_price=result.fill_price,
+                shares=result.filled_size,
+                cost=cost,
+                potential_win=potential_win,
+                potential_loss=cost,
+                zone=result.zone,
+                timestamp=datetime.now()
+            )
+            state.pending_real_trades.append(real_trade)
+            state.log(f"[TRACK] Real trade added: {result.direction} x{result.filled_size:.2f} @ {result.fill_price:.3f}")
+
 
 def get_current_state():
     """Get current (zone, edge, ask) for retry validation."""
@@ -883,23 +1021,21 @@ async def check_and_execute_signal():
         return
 
     # ============================================================
-    # GATE 7: ALPHA_GATE - edge >= ask + margin (SPREAD-AWARE)
+    # GATE 7: BAD_BOOK - Sanity check (spread >= 0 and bid <= ask)
     # ============================================================
-    alpha = s.edge - ask
-
-    # Calculate required margin: max(base_margin, 0.5*spread + fee_buffer)
-    base_margin = CONFIG.get("alpha_margin_base", 0.02)
-    spread_mult = CONFIG.get("alpha_spread_mult", 0.5)
-    fee_buffer = CONFIG.get("alpha_fee_buffer", 0.005)
-    spread_margin = spread_mult * spread + fee_buffer
-    required_margin = max(base_margin, spread_margin)
-
-    if alpha < required_margin:
-        state.log(f"[SKIP] NO_ALPHA: {s.zone}({window_id}) edge={s.edge:.3f} ask={ask:.3f} alpha={alpha:.3f} < {required_margin:.3f} (spread={spread:.3f})")
+    if spread < 0 or bid > ask:
+        state.log(f"[SKIP] BAD_BOOK: {s.zone}({window_id}) bid={bid:.3f} ask={ask:.3f} spread={spread:.3f} tau={s.tau:.0f}s")
         return
 
     # ============================================================
-    # GATE 8: EXECUTOR VALIDATION (zone limits, cooldowns)
+    # GATE 8: SPREAD_GATE - spread <= 0.02 (spread hygiene)
+    # ============================================================
+    if spread > 0.02:
+        state.log(f"[SKIP] SPREAD_GATE: {s.zone}({window_id}) bid={bid:.3f} ask={ask:.3f} spread={spread:.3f} tau={s.tau:.0f}s")
+        return
+
+    # ============================================================
+    # GATE 9: EXECUTOR VALIDATION (zone limits, cooldowns)
     # ============================================================
     valid, reason = executor.validate_signal(s.zone, direction, s.edge, ask)
     if not valid:
@@ -909,7 +1045,19 @@ async def check_and_execute_signal():
     # ============================================================
     # ALL GATES PASSED - Execute trade
     # ============================================================
-    state.log(f"[SIGNAL] {s.zone}({window_id}) {direction} edge={s.edge:.3f} ask={ask:.2f} alpha={alpha:.3f} spread={spread:.3f}")
+    state.log(f"[SIGNAL] {s.zone}({window_id}) {direction} edge={s.edge:.3f} ask={ask:.2f} spread={spread:.3f}")
+
+    # Log signal to real trade log (only if real mode enabled)
+    real_log_signal(
+        market_id=s.slug or "",
+        question=f"BTC 15min {direction}",
+        zone=s.zone,
+        edge=s.edge,
+        direction=direction,
+        best_bid=bid,
+        best_ask=ask,
+        spread=spread
+    )
 
     if is_execution_enabled():
         # REAL EXECUTION - check live trade limit first (0 = unlimited)
@@ -937,6 +1085,18 @@ async def check_and_execute_signal():
             state.session_trade_count += 1  # Also increment session counter
             state.log(f"[REAL] Live trades: {state.live_trades_this_run}/{state.max_live_trades_per_run}")
 
+            # Check if we've hit the max trades cap - trigger clean shutdown
+            if state.max_live_trades_per_run > 0 and state.live_trades_this_run >= state.max_live_trades_per_run:
+                state.log(f"[STOP] Max live trades reached ({state.live_trades_this_run}/{state.max_live_trades_per_run})")
+                state.should_stop = True
+                state.stop_reason = "max_trades_cap"
+                # Log to real trade log
+                real_log_stop(
+                    reason="max_trades_cap",
+                    final_balance=state.usdc_balance,
+                    final_pnl=state.pnl_total
+                )
+
     elif is_real_mode():
         # Real mode but EXECUTION_ENABLED=false - blocked
         state.log(f"[BLOCKED] EXEC:OFF - Would BUY {direction} @ {ask:.2f}")
@@ -954,9 +1114,8 @@ async def check_and_execute_signal():
         potential_loss = CONFIG["cash_per_trade"]  # We lose our cost
         trade_time = datetime.now()
 
-        # FIXED EV: EV = edge - ask (our alpha, simplified no fees)
-        # This is the correct formula: if we think prob=edge and pay ask, EV = edge - ask
-        ev_per_trade = alpha  # alpha = edge - ask, calculated above
+        # EV placeholder - will be calculated properly once p_model exists (Phase 2)
+        ev_per_trade = 0.0  # Cannot calculate without p_model
 
         # CRITICAL: Update executor state even in paper mode to prevent double-fire
         executor.session_trades[s.zone] = executor.session_trades.get(s.zone, 0) + 1
@@ -987,6 +1146,12 @@ async def check_and_execute_signal():
         )
         state.pending_paper_trades.append(paper_trade)
 
+        # Generate paper order ID for tracking
+        paper_order_id = f"PAPER-{trade_time.strftime('%Y%m%d%H%M%S')}-{state.trades_total:04d}"
+
+        # Log submit step (matches real trade lifecycle)
+        state.log(f"[SUBMIT] {s.zone} {direction} @ {ask:.3f} x{shares:.2f} order_id={paper_order_id}")
+
         # Check bid liquidity
         fill_status = "FILLED" if spread < 0.05 else "WIDE SPREAD"
 
@@ -999,6 +1164,7 @@ async def check_and_execute_signal():
         state.log(f"{'='*50}")
         state.log(f"PAPER TRADE #{state.trades_total}")
         state.log(f"{'='*50}")
+        state.log(f"ORDER_ID:  {paper_order_id}")
         state.log(f"TIME:      {trade_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
         state.log(f"SESSION:   {s.slug}")
         state.log(f"ZONE:      {s.zone} ({window_id})")
@@ -1008,12 +1174,11 @@ async def check_and_execute_signal():
         state.log(f"ASK:       {fmt_px(ask)}")
         state.log(f"BID:       {fmt_px(bid)}")
         state.log(f"SPREAD:    ${spread:.4f}")
-        state.log(f"ALPHA:     {alpha:+.4f} (edge-ask, req: {required_margin:.4f})")
         state.log(f"SHARES:    {shares:.4f}")
         state.log(f"COST:      ${CONFIG['cash_per_trade']:.2f}")
         state.log(f"IF_WIN:    +${potential_profit:.2f}")
         state.log(f"IF_LOSE:   -${potential_loss:.2f}")
-        state.log(f"EV/TRADE:  {alpha:+.4f} (alpha)")
+        state.log(f"EV/TRADE:  N/A (awaiting p_model)")
         state.log(f"TOKEN:     {token_id}")
         state.log(f"UP:        bid={fmt_px(s.up.best_bid)} ask={fmt_px(s.up.best_ask)}")
         state.log(f"DOWN:      bid={fmt_px(s.down.best_bid)} ask={fmt_px(s.down.best_ask)}")
@@ -1024,6 +1189,9 @@ async def check_and_execute_signal():
         state.log(f"STATS:     W:{state.trades_won} L:{state.trades_lost} PnL:${state.pnl_total:+.2f}")
         state.log(f"{'='*50}")
         state.log(f"")
+
+        # Explicit FILLED log for lifecycle tracking
+        state.log(f"[FILLED] {paper_order_id} @ {ask:.3f} x{shares:.2f} (paper)")
 
 
 # ============================================================
@@ -1051,6 +1219,10 @@ def on_market_update(session_state: SessionState):
             if state.pending_paper_trades:
                 # Use the LAST known prices from old session
                 settle_paper_trades(last_slug, last_up_price, last_down_price)
+
+            # Settle any pending real trades from old session
+            if state.pending_real_trades:
+                settle_real_trades(last_slug, last_up_price, last_down_price)
 
         state.sessions_seen += 1
         session_had_trade = False  # Reset for new session
@@ -1081,7 +1253,8 @@ async def run_dashboard():
     layout = make_layout()
 
     # Initialize log file - separate folders for real/paper
-    base_logs_dir = Path(__file__).parent / "logs"
+    # Logs go to project root /logs folder
+    base_logs_dir = Path(__file__).parent.parent.parent / "logs"
     if is_real_mode():
         logs_dir = base_logs_dir / "real"
     else:
@@ -1112,6 +1285,9 @@ async def run_dashboard():
     else:
         state.log(f"PAPER MODE - Wallet: {wallet_short}")
 
+    # Initialize real trade logger (only writes if real mode)
+    init_real_logger(log_dir=str(logs_dir), enabled=is_real_mode())
+
     # RESTART WARNING - session state does NOT persist
     state.log("[WARN] Session state resets on restart (zone counters = 0)")
 
@@ -1134,6 +1310,9 @@ async def run_dashboard():
     state.last_balance_check = datetime.now()
     state.log(f"Balance: ${state.usdc_balance:.2f} USDC")
 
+    # Log session start for real trading
+    real_log_start(balance=state.usdc_balance, config=CONFIG)
+
     state.log("Connecting to Polymarket WebSocket...")
 
     # Start session manager
@@ -1146,7 +1325,7 @@ async def run_dashboard():
 
     try:
         with Live(layout, console=console, refresh_per_second=4, screen=True):
-            while True:
+            while not state.should_stop:
                 update_layout(layout)
 
                 # Check for trading signals
@@ -1170,7 +1349,7 @@ async def run_dashboard():
                     pending = len(state.pending_paper_trades)
                     wr = 100 * state.trades_won / settled if settled > 0 else 0
                     ev = state.pnl_total / settled if settled > 0 else 0
-                    state.log(f"[STATS] {int(runtime_mins)}m | Sessions: {state.sessions_seen} (skip:{state.sessions_skipped}) | Trades: {state.trades_total} (pend:{pending}) | W/L: {state.trades_won}/{state.trades_lost} ({wr:.0f}%) | EV: ${ev:+.2f} | PnL: ${state.pnl_total:+.2f}")
+                    state.log(f"[STATS] {int(runtime_mins)}m | Sessions: {state.sessions_seen} (skip:{state.sessions_skipped}) | Trades: {state.trades_total} (pend:{pending}) | W/L: {state.trades_won}/{state.trades_lost} ({wr:.0f}%) | AvgPnL: ${ev:+.2f} | PnL: ${state.pnl_total:+.2f}")
 
                 # Periodic price/status log every 30 seconds for paper mode monitoring
                 runtime_secs = int((datetime.now() - state.start_time).total_seconds())
@@ -1182,8 +1361,38 @@ async def run_dashboard():
                     state.log(f"[LIVE] Zone:{s.zone} T={int(s.tau)}s | UP:{px(s.up.best_bid)}/{px(s.up.best_ask)} DOWN:{px(s.down.best_bid)}/{px(s.down.best_ask)} | Edge:{s.edge:.3f} {s.edge_direction}")
 
                 await asyncio.sleep(0.25)
+
+        # Clean exit due to should_stop flag (e.g., max_trades_cap)
+        if state.should_stop:
+            state.log(f"Clean shutdown: {state.stop_reason}")
+
+            # Final session summary
+            runtime_mins = (datetime.now() - state.start_time).total_seconds() / 60
+            settled = state.trades_won + state.trades_lost
+            pending = len(state.pending_paper_trades)
+            wr = 100 * state.trades_won / settled if settled > 0 else 0
+            ev = state.pnl_total / settled if settled > 0 else 0
+
+            state.log("")
+            state.log("=" * 50)
+            state.log(f"SESSION COMPLETE - {state.stop_reason.upper()}")
+            state.log("=" * 50)
+            state.log(f"Runtime:        {int(runtime_mins)} minutes")
+            state.log(f"Live trades:    {state.live_trades_this_run}/{state.max_live_trades_per_run}")
+            state.log(f"Total PnL:      ${state.pnl_total:+.2f}")
+            state.log(f"Final balance:  ${state.usdc_balance:.2f}")
+            state.log("=" * 50)
+            state.log("Bot stopped cleanly. No Ctrl+C required.")
+
     except KeyboardInterrupt:
         state.log("Shutdown requested...")
+
+        # Log session stop for real trading
+        real_log_stop(
+            reason="manual",
+            final_balance=state.usdc_balance,
+            final_pnl=state.pnl_total
+        )
 
         # Final session summary
         runtime_mins = (datetime.now() - state.start_time).total_seconds() / 60

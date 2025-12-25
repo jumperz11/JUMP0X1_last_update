@@ -1,5 +1,10 @@
 # Telegram Chat Analysis Report: Polymarket Binary Options Trading
 
+**Status:** ARCHIVE (Historical Research)
+**Note:** Research that informed the pivot from arbitrage to directional trading.
+
+---
+
 **Date:** 2025-12-20
 **Source:** Polymarket Lounge Telegram Group (5,254 messages analyzed)
 **Keywords Searched:** fill, queue, balanced, execution, maker/taker, liquidity, partial, arbitrage, edge, EV

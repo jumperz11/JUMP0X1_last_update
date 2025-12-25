@@ -1,3 +1,7 @@
+# ============================================================
+# JUMP0X1 .gitignore
+# ============================================================
+
 # Build artifacts
 target/
 *.exe
@@ -5,43 +9,84 @@ target/
 *.so
 *.dylib
 
-# Logs (keep structure, ignore contents)
-logs/paper/*.log
-logs/real/*.log
+# Logs - keep structure, ignore contents
+logs/
 real_logs/
+*.log
 
-# Data
+# Backtest outputs (large files)
+backtest_full_logs/
+
+# Data directories (large)
 markets_paper/
-markets_paper.7z
-*.jsonl
-*.7z
+data/
 
-# Environment and secrets
+# Archives
+*.7z
+*.zip
+*.tar.gz
+
+# Screenshots and images in archive
+archive/assets/
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# Environment and secrets - NEVER commit!
 .env
 .env.local
 .env.*.local
+*.pem
+*.key
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+.Python
 venv/
 .venv/
+env/
+.eggs/
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+*.sublime-*
 
 # OS
 .DS_Store
 Thumbs.db
 nul
+desktop.ini
 
 # Rust
 Cargo.lock
 
-# Mind (local session)
+# Mind (local session memory)
 .mind/SESSION.md
+
+# Telegram exports
 ChatExport*/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+~*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Coverage
+htmlcov/
+.coverage
+coverage.xml

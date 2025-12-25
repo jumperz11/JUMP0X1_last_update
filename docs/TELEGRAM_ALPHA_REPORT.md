@@ -1,5 +1,10 @@
 # Telegram Alpha Report: The Real Edge
 
+**Status:** ARCHIVE (Historical Research)
+**Note:** Research that informed the pivot from arbitrage to directional trading.
+
+---
+
 **Date:** 2025-12-20
 **Source:** Polymarket Lounge Telegram (5,254 messages)
 **Focus:** Binance/Chainlink prediction edge, execution mechanics, who's profitable

@@ -1,8 +1,13 @@
 # Directional Trading Strategy - Roadmap & Documentation
 
+**Status:** ARCHIVE (Historical Research)
+**Note:** This roadmap led to RULEV3+ Phase 1. See PHASE1_LOCKED.md for current config.
+
+---
+
 **Project:** PK8_PH - Polymarket 15-Minute Binary Options
-**Status:** Phase 4 Complete - Data Collection Ready
-**Last Updated:** 2025-12-20
+**Status:** Completed - Evolved into RULEV3+ Phase 1
+**Last Updated:** 2024-12-24
 
 ---
 

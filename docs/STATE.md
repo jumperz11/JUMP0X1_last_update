@@ -1,7 +1,7 @@
 # JUMP01X - Project State
 
-**Updated:** 2025-12-23
-**Status:** Live Trading Active (Paper Mode)
+**Updated:** 2024-12-24
+**Status:** Phase 1 Paper Trading (Collecting Data)
 
 ---
 
@@ -9,56 +9,63 @@
 
 | Item | Status |
 |------|--------|
-| Strategy | RULEV3+ v1.0 |
+| Strategy | RULEV3+ Phase 1 |
 | Mode | Paper Trading |
+| Config | LOCKED (see PHASE1_LOCKED.md) |
 | Trade Size | $5.00 per trade |
-| First Live Trade | 2025-12-22 (SUCCESS) |
+| Target | 50 trades before review |
 
-## First Live Trade
+---
 
-**Date:** December 22, 2025
-**Session:** btc-updown-15m-1766438100
+## Phase 1 Configuration
 
 ```
-Direction: UP
-Zone: CORE
-Edge: 0.640
-Ask: $0.65
-Shares: 7.69
-Cost: $5.00
-Slippage: 0bps
-Latency: 942ms
-Order ID: 0x7205e791158e74755ac95a02641379b8e51bdd146f4561cd5a3661eb49fc77eb
-Status: FILLED
+ZONE_MODE          = CORE-only (T3 = 3:00-3:29)
+EDGE_THRESHOLD     = 0.64
+SAFETY_CAP         = 0.72
+SPREAD_MAX         = 0.02
+ALPHA_GATE         = REMOVED (structural bug)
+MAX_TRADES_SESSION = 1
+POSITION_SIZE      = $5.00
 ```
 
 ---
 
-## Configuration
+## Gate Order (Phase 1)
 
-### .env Settings
+1. **MODE_ZONE_GATE** - Only CORE zone allowed
+2. **BOOK_GATE** - Must have valid bid/ask
+3. **SESSION_CAP** - Max 1 trade per session
+4. **EDGE_GATE** - edge >= 0.64
+5. **HARD_PRICE_GATE** - ask <= 0.72
+6. **PRICE_GATE** - ask < 0.72
+7. **BAD_BOOK** - spread >= 0 AND bid <= ask
+8. **SPREAD_GATE** - spread <= 0.02
+9. **EXECUTOR_VALIDATION** - zone limits, cooldowns
 
-```bash
-TRADING_MODE=paper
-EXECUTION_ENABLED=false
-MAX_LIVE_TRADES_PER_RUN=0
+---
 
-PM_CASH_PER_TRADE=5.00
-PM_MAX_POSITION=8.00
-PM_EDGE_THRESHOLD=0.64
-PM_SAFETY_CAP=0.72
-```
+## Backtest Results (Phase 1)
 
-### Strategy Parameters
+| Metric | Value |
+|--------|-------|
+| Total sessions | 2,085 |
+| Total trades | 1,064 |
+| Win rate | 72.09% |
+| AvgPnL/trade | $0.3276 |
+| Total PnL | $348.58 |
+| Max drawdown | $65.35 |
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| CORE Window | 3:00-3:29 | Primary entry window |
-| RECOVERY Window | 5:00-5:59 | Secondary entry window |
-| Edge Threshold | >= 0.64 | Minimum edge to trade |
-| Safety Cap | < 0.72 | Maximum price to pay |
-| Trade Size | $5.00 | Per trade |
-| Max Position | $8.00 | Total exposure limit |
+---
+
+## Paper Trade Progress
+
+| Metric | Current | Target |
+|--------|---------|--------|
+| Trades collected | 3 | 50 |
+| W/L | 2/1 | - |
+| Win rate | 67% | ~72% |
+| AvgPnL | $+0.05 | ~$0.33 |
 
 ---
 
@@ -71,6 +78,7 @@ PM_SAFETY_CAP=0.72
 | `ui_dashboard_live.py` | Main trading dashboard |
 | `trade_executor.py` | Order execution engine |
 | `polymarket_connector.py` | WebSocket + CLOB API |
+| `backtest_alpha_test.py` | Phase 1 backtest |
 | `.env` | Configuration |
 
 ### Logs
@@ -79,124 +87,67 @@ PM_SAFETY_CAP=0.72
 |----------|---------|
 | `logs/paper/` | Paper trade logs |
 | `logs/real/` | Real trade logs |
-| `real_logs/` | First live trade archive |
 
 ### Documentation
 
 | File | Content |
 |------|---------|
-| `README.md` | Project overview |
-| `docs/STRATEGY.md` | RULEV3+ strategy details |
+| `PHASE1_LOCKED.md` | Locked Phase 1 config |
 | `docs/STATE.md` | This file |
-| `docs/SETUP.md` | Installation guide |
+| `docs/STRATEGY.md` | Strategy details |
+| `VERSION` | Version tag |
 
 ---
 
-## Dashboard Features
+## Periodic Stats Format
 
-### Header Stats (Live)
 ```
-S:6(2skip) | T:3(1pend) | W/L:1/1(50%) | PnL:$-2.31
+[STATS] 5m | Sessions: 6 (skip:4) | Trades: 2 (pend:1) | W/L: 1/0 (100%) | AvgPnL: $+2.69 | PnL: $+2.69
 ```
 
-- `S:6(2skip)` - Sessions seen (skipped)
-- `T:3(1pend)` - Trades total (pending settlement)
-- `W/L:1/1(50%)` - Wins/Losses (win rate)
-- `PnL:$-2.31` - Running profit/loss
-
-### Panels
-
-1. **Live Prices** - UP/DOWN bid/ask spreads
-2. **Order Book** - Depth and mid prices
-3. **Session Info** - Zone, elapsed, countdown
-4. **Performance** - Trades, W/L, EV, PnL
-5. **Zones** - CORE/RECOVERY entry counts
-6. **Config** - Strategy parameters
-7. **Logs** - Real-time activity
+Note: `AvgPnL` = cumulative PnL / settled trades (renamed from EV for clarity)
 
 ---
 
-## Safety Features
+## Kill Rules
 
-| Feature | Status |
-|---------|--------|
-| Double execution lock | Active |
-| Trade limiter | Active (0 = unlimited) |
-| Kill switch | Ready (2 degraded fills) |
-| Zone limits | Active (1 per zone) |
-| Cooldown | Active (5 seconds) |
-
----
-
-## Logging
-
-### Paper Trade Log Entry
-```
-==================================================
-PAPER TRADE #1
-==================================================
-TIME:      2025-12-22 23:05:02.921
-SESSION:   btc-updown-15m-1766440800
-ZONE:      RECOVERY
-DIRECTION: Up
-FILL:      FILLED (spread: $0.0200)
-EDGE:      0.6400
-ASK:       $0.6500
-BID:       $0.6300
-SHARES:    7.6923
-COST:      $5.00
-IF_WIN:    +$2.69
-IF_LOSE:   -$5.00
-EV/TRADE:  +$0.42
-```
-
-### Settlement Log
-```
-SESSION SETTLEMENT: btc-updown-15m-1766440800
-==================================================
-FINAL UP:   $0.9500
-FINAL DOWN: $0.0500
-WINNER:     UP
-TRADE #1: Up @ $0.65
-  RESULT: WIN | PnL: +$2.69
-```
-
-### Periodic Stats (every 5 min)
-```
-[STATS] 5m | Sessions: 6 (skip:4) | Trades: 2 (pend:1) | W/L: 1/0 (100%) | EV: $+2.69 | PnL: $+2.69
-```
+| Trigger | Threshold | Action |
+|---------|-----------|--------|
+| Max Drawdown | > $130.70 (2x backtest) | STOP |
+| Structural Deviation | Wrong zone/sizing/gate | STOP |
+| Execution Error | Bad fills, cap failure | STOP |
+| AvgPnL Negative | Over 20+ trades | REVIEW |
 
 ---
 
 ## History
 
-### December 22, 2025
+### December 24, 2024
+- Phase 1 LOCKED
+- Removed alpha gate (structural bug: always negative)
+- Added spread hygiene gate (spread <= 0.02)
+- Renamed EV → AvgPnL in [STATS] log (label only)
+- Created PHASE1_LOCKED.md
+- Created VERSION file
+- 3 paper trades collected (2W/1L)
+
+### December 22-23, 2024
 - First successful live trade executed
 - Switched to paper mode for extended testing
 - Added win/loss settlement tracking
-- Added sessions skipped counter
-- Added EV per trade calculation
-- Added bid fill status tracking
-- Enhanced logging with all metrics
-
-### December 21, 2025
 - Completed pre-live verification (44 tests)
-- Added double execution lock
-- Added trade limiter
-- Added kill switch
 
 ---
 
 ## Next Steps
 
-1. Run paper trading overnight
-2. Collect 50+ settled trades
-3. Analyze win rate by zone (CORE vs RECOVERY)
-4. Validate EV calculations
-5. Consider going live with small position
+1. Continue paper trading (collect 50 trades)
+2. Monitor metrics vs backtest
+3. Review after 50 trades or kill rule
+4. Phase 2: Build p_model for true alpha calculation
 
 ---
 
 **Mode:** Paper
-**Strategy:** RULEV3+ v1.0
-**Balance:** $11.90 USDC
+**Strategy:** RULEV3+ Phase 1
+**Config:** LOCKED

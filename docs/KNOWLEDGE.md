@@ -1,5 +1,10 @@
 # KNOWLEDGE.md - InsideTrader Intel Archive
 
+**Status:** ARCHIVE (Historical Reference)
+**Note:** This document preserves research from the balanced arbitrage phase. Current strategy is RULEV3+ Phase 1 (directional trading).
+
+---
+
 This document preserves all trading knowledge acquired from InsideTrader, a trader with 17 years of development experience who shared his Polymarket framework and insights.
 
 ---

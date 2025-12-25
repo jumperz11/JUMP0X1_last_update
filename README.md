@@ -1,4 +1,4 @@
-# JUMP01X - RULEV3+ Polymarket Trading Bot
+# JUMP0X1 - RULEV3+ Polymarket Trading Bot
 
 Directional trading bot for Polymarket BTC 15-minute Up/Down prediction markets.
 
@@ -7,7 +7,7 @@ Directional trading bot for Polymarket BTC 15-minute Up/Down prediction markets.
 Trades Polymarket's "Will BTC go up in the next 15 minutes?" markets using RULEV3+ strategy.
 
 **The Strategy:**
-- Enter in specific time windows (CORE: 3:00-3:29, RECOVERY: 5:00-5:59)
+- Enter in specific time windows (CORE: 3:00-3:29)
 - Edge threshold >= 0.64 (mid price of stronger side)
 - Safety cap < 0.72 (avoid overpaying)
 - Auto-settlement at session end (no need to sell)
@@ -33,9 +33,41 @@ pip install rich py-clob-client python-dotenv websockets aiohttp
 cp .env.example .env
 # Edit .env with your Polymarket credentials
 
-# 3. Run (paper mode by default)
-python ui_dashboard_live.py
+# 3. Run paper trading (simulation)
+python run_paper.py
+
+# Or on Windows:
+RUN_PAPER.bat
 ```
+
+## How to Run
+
+### Paper Trading (Simulation)
+```bash
+python run_paper.py
+# or
+RUN_PAPER.bat  # Windows
+```
+No real orders placed. Safe for testing.
+
+### Live Trading (Real Money)
+```bash
+# First, update .env:
+# TRADING_MODE=real
+# EXECUTION_ENABLED=true
+
+python run_live.py
+# or
+RUN_LIVE.bat  # Windows
+```
+
+### Pre-Live Verification
+```bash
+python scripts/verify_pre_live.py
+# or
+RUN_VERIFY.bat  # Windows
+```
+Run this before going live to verify all safety checks pass.
 
 ## Trading Modes
 
@@ -48,24 +80,38 @@ python ui_dashboard_live.py
 ## Project Structure
 
 ```
-JUMP01X/
-├── ui_dashboard_live.py      # Main trading dashboard
-├── trade_executor.py         # Order execution engine
-├── polymarket_connector.py   # WebSocket + API connector
-├── .env                      # Configuration (private keys, settings)
+JUMP0X1/
+├── run_paper.py              # Entry: Paper trading
+├── run_live.py               # Entry: Live trading
+├── RUN_PAPER.bat             # Windows: Paper trading
+├── RUN_LIVE.bat              # Windows: Live trading
+├── RUN_VERIFY.bat            # Windows: Pre-live checks
+├── .env                      # Configuration (gitignored)
 │
-├── logs/
-│   ├── paper/               # Paper trade logs
-│   └── real/                # Real trade logs
+├── src/
+│   ├── core/                 # Core trading modules
+│   │   ├── trade_executor.py
+│   │   ├── polymarket_connector.py
+│   │   └── real_trade_logger.py
+│   └── ui/
+│       └── ui_dashboard_live.py  # Main dashboard
 │
-├── docs/
-│   ├── STRATEGY.md          # RULEV3+ strategy details
-│   ├── STATE.md             # Current project status
-│   └── SETUP.md             # Installation guide
+├── scripts/
+│   └── verify_pre_live.py    # Pre-live verification
 │
-└── backtest_full_logs/      # Historical backtest data
-    ├── scripts/             # Backtest scripts
-    └── reports/             # Analysis reports
+├── experiments/              # Backtest experiments
+│   └── backtest_*.py
+│
+├── docs/                     # Documentation
+│   ├── GO_LIVE_CHECKLIST.md
+│   ├── PHASE1_LOCKED.md
+│   └── MIGRATION_NOTES.md
+│
+├── logs/                     # Trade logs (gitignored)
+│   ├── paper/
+│   └── real/
+│
+└── archive/                  # Archived files
 ```
 
 ## Configuration (.env)
@@ -108,7 +154,7 @@ PM_SAFETY_CAP=0.72           # Max price to pay
 - Order book depth
 - Session info (zone, elapsed, countdown)
 - Performance (trades, W/L, EV, PnL)
-- Zones (CORE/RECOVERY entries)
+- Zones (CORE entries)
 - Config (strategy parameters)
 - Logs (real-time activity)
 
@@ -116,9 +162,10 @@ PM_SAFETY_CAP=0.72           # Max price to pay
 
 1. **Double lock** - Requires BOTH `TRADING_MODE=real` AND `EXECUTION_ENABLED=true`
 2. **Trade limiter** - `MAX_LIVE_TRADES_PER_RUN` caps live orders
-3. **Kill switch** - Auto-stops after 2 degraded fills
+3. **Kill switch** - Auto-stops after 2 degraded fills or 3 consecutive losses
 4. **Zone limits** - Max 1 trade per zone per session
-5. **Cooldown** - 5s between trades
+5. **Cooldown** - 30s between trades
+6. **PnL floor** - Auto-stops if cumulative PnL drops below -$5
 
 ## Logs
 
@@ -131,6 +178,15 @@ PM_SAFETY_CAP=0.72           # Max price to pay
 - Settlement results (win/loss, PnL)
 - Periodic stats (every 5 min)
 - Final session summary
+
+## Backtest Results
+
+| Strategy | Trades | Win Rate | Total PnL | EV/Trade |
+|----------|--------|----------|-----------|----------|
+| RULEV1 (baseline) | 2,046 | 59.8% | -$26.94 | -$0.013 |
+| **RULEV3+ T3-only** | 662 | 63.5% | **+$13.42** | **+$0.020** |
+
+**T3-only (CORE zone) is the only positive-EV configuration.**
 
 ## First Live Trade
 
@@ -146,19 +202,18 @@ Shares: 7.69
 Cost: $5.00
 Slippage: 0bps
 Latency: 942ms
-Order ID: 0x7205e791...
 ```
 
 ## Docs
 
 | File | Description |
 |------|-------------|
-| [docs/STRATEGY.md](docs/STRATEGY.md) | RULEV3+ strategy logic |
-| [docs/STATE.md](docs/STATE.md) | Current project status |
-| [docs/SETUP.md](docs/SETUP.md) | Installation guide |
+| [docs/GO_LIVE_CHECKLIST.md](docs/GO_LIVE_CHECKLIST.md) | Pre-live safety checklist |
+| [docs/PHASE1_LOCKED.md](docs/PHASE1_LOCKED.md) | Phase 1 configuration lock |
+| [docs/MIGRATION_NOTES.md](docs/MIGRATION_NOTES.md) | Repository restructure notes |
 
 ---
 
-**Status:** Live Trading Active (Dec 2025)
-**Strategy:** RULEV3+ Directional
-**Mode:** Paper (testing)
+**Status:** Paper Trading (Dec 2025)
+**Strategy:** RULEV3+ T3-only
+**Mode:** Paper (keep until sanity checked)

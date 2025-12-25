@@ -27,6 +27,12 @@ from py_clob_client.clob_types import (
     OrderArgs, OrderType
 )
 
+# Real trade logging (only writes when enabled=True in real mode)
+from .real_trade_logger import (
+    init_real_logger, get_real_logger,
+    real_log_submit, real_log_filled, real_log_kill
+)
+
 
 class OrderStatus(Enum):
     PENDING = "PENDING"
@@ -61,7 +67,7 @@ class OrderResult:
 @dataclass
 class ExecutorConfig:
     # Trade sizing
-    cash_per_trade: float = 1.0
+    cash_per_trade: float = 5.0  # $5 risk per trade
 
     # Timeouts by zone (ms)
     core_timeout_ms: int = 1000      # 600-1200ms recommended
@@ -87,6 +93,11 @@ class ExecutorConfig:
     # RULEV3+ thresholds
     edge_threshold: float = 0.64
     safety_cap: float = 0.72
+
+    # === KILLSWITCH SETTINGS ===
+    max_consec_losses: int = 3       # Kill after 3 consecutive losses
+    pnl_floor_dollars: float = -5.0  # Kill if cumulative PnL drops below -$5 (1R buffer)
+    pause_on_kill: bool = True       # Pause (vs exit) when killed
 
 
 class TradeExecutor:
@@ -119,7 +130,16 @@ class TradeExecutor:
         self.session_trades: Dict[str, int] = {}  # zone -> count
         self.degraded_count: int = 0
         self.kill_switch: bool = False
+        self.kill_reason: str = ""
         self.last_trade_time: Optional[datetime] = None
+
+        # Killswitch tracking (persists across sessions)
+        self.consecutive_losses: int = 0
+        self.cumulative_pnl: float = 0.0
+        self.total_trades: int = 0
+        self.total_wins: int = 0
+        self.total_losses: int = 0
+        self.settled_trade_ids: set = set()  # Guard against double-settlement
 
     def log(self, msg: str):
         if self.on_log:
@@ -162,9 +182,23 @@ class TradeExecutor:
         if session_id != self.current_session:
             self.current_session = session_id
             self.session_trades = {"CORE": 0, "RECOVERY": 0}
-            self.degraded_count = 0
-            self.kill_switch = False
-            self.log(f"New session: {session_id}")
+            # NOTE: degraded_count is NOT reset per session - execution issues persist
+            # NOTE: kill_switch is NOT reset per session - only manually via reset_killswitch()
+            self.log(f"[EXEC] New session: {session_id}")
+            if self.kill_switch:
+                self.log(f"[EXEC] KILLSWITCH still active: {self.kill_reason}")
+            if self.degraded_count > 0:
+                self.log(f"[EXEC] Degraded fills: {self.degraded_count}/{self.config.degraded_kill_count}")
+
+    def reset_killswitch(self):
+        """Manually reset killswitch (use with caution)."""
+        if self.kill_switch:
+            self.log(f"[KILLSWITCH] Manually reset (was: {self.kill_reason})")
+        self.kill_switch = False
+        self.kill_reason = ""
+        self.consecutive_losses = 0
+        self.degraded_count = 0  # Also reset degraded counter
+        # Note: cumulative_pnl is NOT reset
 
     def can_trade(self, zone: str) -> tuple[bool, str]:
         """
@@ -173,7 +207,21 @@ class TradeExecutor:
         """
         # Kill switch active?
         if self.kill_switch:
-            return False, "Kill switch active (too many degraded fills)"
+            return False, f"KILL SWITCH: {self.kill_reason}"
+
+        # Consecutive losses check
+        if self.consecutive_losses >= self.config.max_consec_losses:
+            self.kill_switch = True
+            self.kill_reason = f"{self.consecutive_losses} consecutive losses"
+            self.log(f"[KILLSWITCH] Activated: {self.kill_reason}")
+            return False, f"KILL SWITCH: {self.kill_reason}"
+
+        # PnL floor check (<=, not <, to kill exactly at floor)
+        if self.cumulative_pnl <= self.config.pnl_floor_dollars:
+            self.kill_switch = True
+            self.kill_reason = f"PnL ${self.cumulative_pnl:.2f} below floor ${self.config.pnl_floor_dollars}"
+            self.log(f"[KILLSWITCH] Activated: {self.kill_reason}")
+            return False, f"KILL SWITCH: {self.kill_reason}"
 
         # Zone limit reached?
         zone_count = self.session_trades.get(zone, 0)
@@ -192,6 +240,51 @@ class TradeExecutor:
             return False, f"Insufficient balance (${self.balance:.2f})"
 
         return True, "OK"
+
+    def record_result(self, won: bool, pnl: float, trade_id: str = None):
+        """
+        Record trade result and check killswitch conditions.
+        Call this after each trade settles.
+
+        Args:
+            won: True if trade won
+            pnl: Realized PnL for this trade
+            trade_id: Unique trade identifier to prevent double-counting
+        """
+        # Guard against duplicate settlements
+        if trade_id:
+            if trade_id in self.settled_trade_ids:
+                self.log(f"[WARN] Duplicate settlement ignored: {trade_id}")
+                return
+            self.settled_trade_ids.add(trade_id)
+
+        self.total_trades += 1
+        self.cumulative_pnl += pnl
+
+        if won:
+            self.total_wins += 1
+            self.consecutive_losses = 0  # Reset streak
+        else:
+            self.total_losses += 1
+            self.consecutive_losses += 1
+
+        # Log status
+        self.log(f"[RESULT] {'WIN' if won else 'LOSS'} | PnL: ${pnl:+.2f} | "
+                 f"Cumulative: ${self.cumulative_pnl:+.2f} | "
+                 f"Consec Losses: {self.consecutive_losses}/{self.config.max_consec_losses}")
+
+        # Check killswitch conditions
+        if self.consecutive_losses >= self.config.max_consec_losses:
+            self.kill_switch = True
+            self.kill_reason = f"{self.consecutive_losses} consecutive losses"
+            self.log(f"[KILLSWITCH] ACTIVATED: {self.kill_reason}")
+            real_log_kill("consec_losses", str(self.consecutive_losses))
+
+        if self.cumulative_pnl <= self.config.pnl_floor_dollars:
+            self.kill_switch = True
+            self.kill_reason = f"PnL ${self.cumulative_pnl:.2f} hit floor ${self.config.pnl_floor_dollars}"
+            self.log(f"[KILLSWITCH] ACTIVATED: {self.kill_reason}")
+            real_log_kill("pnl_floor", f"${self.cumulative_pnl:.2f}")
 
     def validate_signal(
         self,
@@ -321,6 +414,15 @@ class TradeExecutor:
                 result.status = OrderStatus.SUBMITTED
                 self.log(f"[{zone}] Submitted: {result.order_id} ({submit_ms}ms)")
 
+                # Log to real trade log (only if real mode enabled)
+                real_log_submit(
+                    order_id=result.order_id,
+                    side=direction,
+                    limit_price=price,
+                    shares=result.size,
+                    max_loss_estimate=self.config.cash_per_trade
+                )
+
                 # Step 2: Poll for fill (short timeout)
                 fill_start = time.time()
                 timeout_sec = timeout_ms / 1000
@@ -358,7 +460,9 @@ class TradeExecutor:
                                     # Kill switch?
                                     if self.degraded_count >= self.config.degraded_kill_count:
                                         self.kill_switch = True
+                                        self.kill_reason = f"{self.degraded_count} degraded fills"
                                         self.log(f"[{zone}] KILL SWITCH activated ({self.degraded_count} degraded fills)")
+                                        real_log_kill("degraded_fills", str(self.degraded_count))
                                 else:
                                     self.log(f"[{zone}] FILLED: {size_matched:.3f} @ {result.fill_price:.3f} "
                                             f"(slip: {result.slippage_bps:.0f}bps)")
@@ -381,6 +485,15 @@ class TradeExecutor:
                                 self.log(f"BALANCE:   ${self.balance:.2f}")
                                 self.log(f"{'='*50}")
                                 self.log(f"")
+
+                                # Log to real trade log (only if real mode enabled)
+                                real_log_filled(
+                                    order_id=result.order_id,
+                                    fill_price=result.fill_price,
+                                    fill_time=result.fill_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] if result.fill_time else "",
+                                    slippage_bps=result.slippage_bps,
+                                    degraded=result.degraded
+                                )
 
                                 # Update state
                                 self.balance -= result.fill_price * result.filled_size
@@ -500,7 +613,7 @@ async def test_executor():
     from dotenv import load_dotenv
     from pathlib import Path
 
-    load_dotenv(Path(__file__).parent / ".env")
+    load_dotenv(Path(__file__).parent.parent.parent / ".env")
 
     private_key = os.getenv("PM_PRIVATE_KEY", "")
     funder = os.getenv("PM_FUNDER_ADDRESS", "")

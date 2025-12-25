@@ -1,4 +1,59 @@
-# ARCHITECTURE.md - Rust Framework Internals
+# ARCHITECTURE.md
+
+**Status:** LEGACY (Rust) + CURRENT (Python)
+**Updated:** 2024-12-24
+
+---
+
+## Current System (Python)
+
+The active trading system is Python-based:
+
+| File | Purpose |
+|------|---------|
+| `ui_dashboard_live.py` | Main trading dashboard (Rich TUI) |
+| `trade_executor.py` | Order execution engine |
+| `polymarket_connector.py` | WebSocket + CLOB API connector |
+| `backtest_alpha_test.py` | Phase 1 backtest |
+
+### Python Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    POLYMARKET APIs                       │
+└─────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│              polymarket_connector.py                     │
+│   GammaClient (HTTP) + ClobWebSocket (WS)               │
+│   SessionManager (rollover handling)                     │
+└─────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│              ui_dashboard_live.py                        │
+│   DashboardState + check_and_execute_signal()           │
+│   9 gates: ZONE, BOOK, CAP, EDGE, PRICE, SPREAD...     │
+└─────────────────────────────────────────────────────────┘
+                          │
+              ┌───────────┴───────────┐
+              ▼                       ▼
+┌──────────────────────┐   ┌──────────────────────┐
+│    PAPER MODE        │   │     REAL MODE        │
+│  (settlement sim)    │   │  trade_executor.py   │
+└──────────────────────┘   └──────────────────────┘
+```
+
+---
+
+## Legacy System (Rust) - PK8_PH
+
+> **Note:** The Rust framework below is archived. The current system uses Python.
+
+---
+
+# LEGACY: Rust Framework Internals
 
 ## Overview
 
